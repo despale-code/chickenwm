@@ -1,0 +1,26 @@
+# Build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local AI-agent / editor configuration (not part of the project)
+/.claude/
+/.mcp.json
+/CLAUDE.md
+/AGENTS.md
+/.ragpilot/
+/.vscode/
+/.idea/
+
+# Personal wallpapers and user config never belong in the repo.
+# Only the generated placeholder in assets/wallpapers/ is tracked.
+/bg/
+*.jpg
+*.jpeg
+*.webp
+!/assets/**
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
