@@ -20,3 +20,8 @@ parking_lot.workspace = true
 crossbeam-channel.workspace = true
 windows.workspace = true
 image.workspace = true
+zip.workspace = true
+egui = { workspace = true, optional = true }
+
+[features]
+egui = ["dep:egui"]

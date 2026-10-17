@@ -461,11 +461,12 @@ dependencies = [
 
 [[package]]
 name = "chickenbrowser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adblock",
  "anyhow",
  "chickenwm-core",
+ "image",
  "serde",
  "serde_json",
  "tao",
@@ -478,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "chickenctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -490,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-binds"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -503,11 +504,12 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
  "dirs 6.0.0",
+ "egui",
  "image",
  "notify",
  "parking_lot",
@@ -519,11 +521,12 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.58.0",
  "winnow 0.7.15",
+ "zip",
 ]
 
 [[package]]
 name = "chickenwm-dwm-hook"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -539,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-files"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -565,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-launcher"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -586,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-notify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -603,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-paper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -620,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-rooster"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -635,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-settings"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -651,8 +654,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chickenwm-shot"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "chickenwm-core",
+ "dirs 6.0.0",
+ "eframe",
+ "egui",
+ "image",
+ "raw-window-handle",
+ "tracing",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "chickenwm-wm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -3493,7 +3511,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "roobar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chickenwm-core",

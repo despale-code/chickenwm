@@ -12,6 +12,7 @@ pub mod config;
 pub mod css;
 pub mod elevation;
 pub mod failsafe;
+pub mod fonts;
 pub mod frame_scheduler;
 pub mod handles;
 pub mod icon_theme;
@@ -25,13 +26,60 @@ pub mod wallpaper;
 use anyhow::Result;
 
 /// Initializes structured `tracing` logging for a ChickenWM binary.
+///
+/// Logs go to stdout and to `~/.config/chickenwm/logs/<module>.log` (the modules have no console
+/// when rooster starts them, so without the file a crash leaves no trace). Panics are written
+/// there too, with a backtrace.
 pub fn init_tracing(module_name: &str) {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("info,{module_name}=debug")));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    let file = open_log_file(module_name);
+    let file_writer = file.map(|f| std::sync::Mutex::new(f));
+    match file_writer {
+        Some(w) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(w))
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
+        }
+    }
+    install_panic_log(module_name);
+}
+
+/// `logs/<module>.log`, appended; rotated to `.old` past 2 MB so it can't grow forever.
+fn open_log_file(module_name: &str) -> Option<std::fs::File> {
+    let dir = config::config_dir().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{module_name}.log"));
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, dir.join(format!("{module_name}.log.old")));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+/// Records panics (message, location, backtrace) in the module's log before the default hook
+/// runs, then also in `logs/crashes.log`, one place to look when a module keeps dying.
+fn install_panic_log(module_name: &str) {
+    let module = module_name.to_string();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let report = format!("PANIC in {module} (thread '{thread}'): {info}\n{backtrace}");
+        tracing::error!("{report}");
+        let dir = config::config_dir().join("logs");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crashes.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "==== {:?}\n{report}", std::time::SystemTime::now());
+        }
+        default(info);
+    }));
 }
 
 /// Phase 10.3: Ensures `~/.config/chickenwm/chickenwm.conf` and the default dark-mode CSS themes

@@ -1807,7 +1807,9 @@ bind = $mainMod, V, togglefloating,
 bind = $mainMod, F, fullscreen, 0
 bind = $mainMod, P, pseudo,
 bind = $mainMod, J, togglesplit,
-bind = $mainMod SHIFT, S, exec, ms-screenclip:
+bind = $mainMod SHIFT, S, exec, chickenwm-shot.exe
+bind = , Print, exec, chickenwm-shot.exe
+bind = SHIFT, Print, exec, chickenwm-shot.exe --full
 
 # Focus movement
 bind = $mainMod, Left, movefocus, l

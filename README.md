@@ -58,6 +58,7 @@ ChickenWM is a Cargo workspace of small programs that talk to each other over a 
 | `roobar.exe` | The status bar: workspaces, active window title, clock, CPU, memory, layout. Flat floating "islands". |
 | `chickenwm-launcher.exe` | Fuzzy app launcher with its own card design. Also a calculator, shell-command runner, window switcher and power menu. |
 | `chickenwm-files.exe` | File explorer: details/icons/columns/dual-pane views, tabs, previews, real context menus, drag and drop, Recycle Bin, Explorer-compatible copy/paste. Can be made the system-wide default file manager. |
+| `chickenwm-shot.exe` | Screenshots: freezes the screen, then drag a region, click a window or press Space for the whole monitor. Copies to the clipboard, saves a PNG to `Pictures\Screenshots` and shows a notification. `--full` captures the monitor under the cursor straight away. |
 | `chickenwm-settings.exe` | Settings app in the style of macOS System Settings (searchable sidebar, grouped cards). Edits `chickenwm.conf` without destroying your formatting; has the theme gallery, CSS editor, bezier curve editor, shortcut recorder and window-rule inspector. `--page appearance` opens a page directly. |
 | `chickenbrowser.exe` | A lightweight browser on Microsoft Edge WebView2 with tabs, built-in ad/tracker blocking, Chromium extensions (Proton Pass works) and memory-saving options. |
 | `chickenctl.exe` | Command-line control: reload, dispatch commands, list windows/monitors, set wallpaper, change the theme, emergency restore. Modeled on Hyprland's `hyprctl`. |
@@ -187,7 +188,8 @@ open in Explorer, because only Explorer can display them.
 | `Super` + `F` | Fullscreen |
 | `Super` + `P` | Pseudo-tile |
 | `Super` + `J` | Toggle split direction |
-| `Super` + `Shift` + `S` | Screenshot (Snipping Tool) |
+| `Print Screen` or `Super` + `Shift` + `S` | Screenshot (region, window or screen) |
+| `Shift` + `Print Screen` | Screenshot of the whole monitor |
 | `Super` + arrows | Move focus |
 | `Super` + `Shift` + arrows | Move the window |
 | `Super` + `Ctrl` + arrows | Resize the window |
@@ -429,6 +431,12 @@ History is kept in `.config\chickenwm\notifications.json`.
 `chickenbrowser` is a small browser on Edge WebView2:
 
 - Tabs, address bar search (DuckDuckGo by default), and built-in EasyList/EasyPrivacy ad blocking.
+- **History suggestions**: the address bar suggests pages you've visited as you type (arrow keys to
+  pick). History is kept in `.config\chickenwm\chickenbrowser\history.json`; *Clear browsing data*
+  wipes it.
+- **Session restore**: your tabs come back on the next start (`session.json`). Only the active tab
+  loads right away; the others load when you select them.
+- A small **RAM** readout at the bottom left shows the browser's total memory use.
 - **Extensions**: unpack a Chromium extension into `.config\chickenwm\chickenbrowser\extensions\<name>\`
   and restart the browser. Proton Pass is supported: known store extensions get their official
   extension ID, so their web sign-in works.
@@ -463,6 +471,7 @@ cargo run -p chickenwm-rooster -- --no-children   # daemon only, start modules y
 | `roobar/` | Status bar |
 | `chickenwm-launcher/` | Launcher |
 | `chickenwm-files/` | File explorer |
+| `chickenwm-shot/` | Screenshot tool |
 | `chickenwm-settings/` | Settings |
 | `chickenbrowser/` | Browser |
 | `chickenctl/` | CLI |

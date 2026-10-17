@@ -24,3 +24,6 @@
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Personal notes
+/new-todo.txt

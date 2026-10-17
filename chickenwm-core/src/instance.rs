@@ -57,6 +57,11 @@ impl Instance {
 /// Tries to become the daemon. `wait_ms` is how long to wait for a previous daemon to let go
 /// (0 for a normal start, a few seconds when taking over from one that is exiting).
 pub fn claim_daemon_instance(wait_ms: u32) -> Instance {
+    claim_instance("Local\\ChickenWMRoosterDaemon", wait_ms)
+}
+
+/// Claims the session-wide mutex `name` (e.g. `Local\ChickenWMShot`) for a single-instance tool.
+pub fn claim_instance(name: &str, wait_ms: u32) -> Instance {
     unsafe {
         // Interactive users may open it too, so a normal process can see an elevated daemon.
         let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -75,7 +80,7 @@ pub fn claim_daemon_instance(wait_ms: u32) -> Instance {
         let handle = CreateMutexW(
             have_sd.then_some(&attrs as *const SECURITY_ATTRIBUTES),
             false,
-            w!("Local\\ChickenWMRoosterDaemon"),
+            &windows::core::HSTRING::from(name),
         );
         if have_sd {
             let _ = LocalFree(HLOCAL(sd.0));
@@ -99,15 +104,17 @@ mod tests {
 
     #[test]
     fn second_claim_is_a_duplicate_until_the_first_releases() {
-        let first = match claim_daemon_instance(0) {
+        // A name of its own, so a running ChickenWM doesn't interfere.
+        const NAME: &str = r"Local\ChickenWMInstanceTest";
+        let first = match claim_instance(NAME, 0) {
             Instance::Primary(g) => g,
             Instance::Duplicate(_) => panic!("first claim should win"),
         };
         // Mutexes are owned per thread, so claim from another one like a second process would.
-        let second = std::thread::spawn(|| matches!(claim_daemon_instance(0), Instance::Primary(_)));
+        let second = std::thread::spawn(|| matches!(claim_instance(NAME, 0), Instance::Primary(_)));
         assert!(!second.join().unwrap(), "second claim must be a duplicate");
         first.release();
-        let third = std::thread::spawn(|| matches!(claim_daemon_instance(0), Instance::Primary(_)));
+        let third = std::thread::spawn(|| matches!(claim_instance(NAME, 0), Instance::Primary(_)));
         assert!(third.join().unwrap(), "claim succeeds after release");
     }
 }

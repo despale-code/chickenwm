@@ -65,7 +65,9 @@ pub fn eject_dwm_hooks() {
 
 /// Immediately restores `explorer.exe` as the Windows shell, disables the process killer,
 /// ejects any DWM hooks, launches `C:\Windows\explorer.exe`, and optionally terminates all `chickenwm` processes.
+#[track_caller]
 pub fn trigger_emergency_restore(terminate_self: bool) {
+    let caller = std::panic::Location::caller();
     // Prevent re-entrant triggers
     if FAILSAFE_TRIGGERED.swap(true, Ordering::SeqCst) && terminate_self {
         return;
@@ -81,7 +83,7 @@ pub fn trigger_emergency_restore(terminate_self: bool) {
     // 1. Immediately disable the explorer.exe suppressor & eject any DWM hooks
     EXPLORER_KILLER_ENABLED.store(false, Ordering::SeqCst);
     eject_dwm_hooks();
-    warn!("EMERGENCY FAILSAFE TRIGGERED: Restoring explorer.exe shell, ejecting DWM hooks, and disabling process suppressor!");
+    warn!("EMERGENCY FAILSAFE TRIGGERED (from {caller}): Restoring explorer.exe shell, ejecting DWM hooks, and disabling process suppressor!");
 
     // 2. Restore HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell -> explorer.exe
     if let Err(e) = restore_winlogon_shell_registry() {
