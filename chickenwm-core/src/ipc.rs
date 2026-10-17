@@ -270,6 +270,9 @@ pub enum IpcCommand {
         suppress_explorer: bool,
         register_files_handler: bool,
     },
+    /// Restart the whole shell with administrator rights (shows the UAC prompt), so windows of
+    /// elevated programs can be tiled. Answers with an error if the prompt is declined.
+    RestartElevated,
     /// Query overall daemon, WM, and module watchdog status.
     QueryStatus,
     /// Set wallpaper or live WGSL shader on `chickenwm-paper`.
@@ -368,6 +371,46 @@ pub enum IpcResponse {
 }
 
 /// Asynchronous Named Pipe Server listening on `pipe_name`.
+/// Creates one pipe instance that any program of the signed-in user can open. The default ACL of
+/// an elevated process only admits administrators, which would lock normal-privilege clients
+/// (chickenctl, Settings, the launcher, the WM) out of an elevated daemon.
+fn create_pipe(name: &str, first: bool) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    // SYSTEM, Administrators and interactive users: full access.
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    };
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first);
+    if converted.is_err() {
+        return options.create(name);
+    }
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let pipe = unsafe {
+        options.create_with_security_attributes_raw(name, &mut attrs as *mut _ as *mut core::ffi::c_void)
+    };
+    unsafe {
+        let _ = LocalFree(HLOCAL(sd.0));
+    }
+    pipe
+}
+
 pub async fn serve_ipc<F, Fut>(pipe_name: &str, handler: F) -> Result<()>
 where
     F: Fn(IpcCommand) -> Fut + Send + Sync + 'static,
@@ -375,20 +418,18 @@ where
 {
     let pipe_name = pipe_name.to_string();
     let handler = Arc::new(handler);
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&pipe_name)
+    let mut server = create_pipe(&pipe_name, true)
         .with_context(|| format!("Failed to create named pipe server {}", pipe_name))?;
 
     loop {
         let connected_res = server.connect().await;
         // Immediately allocate the next pipe instance before handling the current client
         // so concurrent callers never hit ERROR_FILE_NOT_FOUND / ERROR_PIPE_BUSY.
-        let next_server = match ServerOptions::new().create(&pipe_name) {
+        let next_server = match create_pipe(&pipe_name, false) {
             Ok(s) => s,
             Err(_) => {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                match ServerOptions::new().create(&pipe_name) {
+                match create_pipe(&pipe_name, false) {
                     Ok(s) => s,
                     Err(e) => return Err(e).context("Failed to recreate named pipe instance"),
                 }
@@ -496,4 +537,18 @@ pub fn send_ipc_command_blocking(pipe_name: &str, cmd: &IpcCommand) -> Result<Ip
     reader.read_line(&mut line)?;
     let resp: IpcResponse = serde_json::from_str(line.trim())?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn secured_pipe_instances_can_be_created_and_connected() {
+        let name = format!(r"\\.\pipe\chickenwm-test-{}", std::process::id());
+        let first = create_pipe(&name, true).expect("first instance");
+        let second = create_pipe(&name, false).expect("second instance");
+        let client = ClientOptions::new().open(&name).expect("client connects");
+        drop((first, second, client));
+    }
 }

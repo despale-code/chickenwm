@@ -346,6 +346,19 @@ pub fn find_process_ids(names: &[&str]) -> Vec<u32> {
     pids
 }
 
+/// Stops every supervised ChickenWM module but leaves the daemon alone (and explorer
+/// untouched), for handing the shell over to a freshly started daemon.
+pub fn terminate_modules() {
+    terminate_processes(&[
+        "chickenwm-wm.exe",
+        "chickenwm-binds.exe",
+        "chickenwm-paper.exe",
+        "roobar.exe",
+        "chickenwm-launcher.exe",
+        "chickenwm-notify.exe",
+    ]);
+}
+
 /// Force-terminates every other process matching `names` (never the current process).
 fn terminate_processes(names: &[&str]) {
     for pid in find_process_ids(names) {

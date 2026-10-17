@@ -478,8 +478,11 @@ Logs go to stdout; run a module from a terminal to see them. Set `RUST_LOG=debug
   Force it with `windowrulev2 = float, class:^(...)$`, or pick it with the crosshair in Settings →
   Window Rules.
 - **Task Manager or another admin window floats**: Windows doesn't let a normal program move the
-  windows of a program running as administrator. ChickenWM leaves those windows floating and shows
-  a notification. Run rooster as administrator to tile them too.
+  windows of a program running as administrator. ChickenWM leaves those windows floating and asks
+  whether to restart as administrator (you approve the Windows prompt). To always start elevated,
+  turn on **Settings → General → Run ChickenWM as administrator**: it asks for approval once and
+  registers a scheduled task, so later sign-ins start elevated without a prompt. Programs you
+  launch from an elevated ChickenWM also run as administrator.
 - **Windows on other workspaces**: they are moved far off-screen ("parked") instead of hidden, so
   Task Manager still groups them under their app. Exiting ChickenWM puts them all back.
 - **The browser doesn't start**: install the

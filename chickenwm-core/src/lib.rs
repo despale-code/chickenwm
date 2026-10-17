@@ -10,10 +10,12 @@
 
 pub mod config;
 pub mod css;
+pub mod elevation;
 pub mod failsafe;
 pub mod frame_scheduler;
 pub mod handles;
 pub mod icon_theme;
+pub mod instance;
 pub mod ipc;
 pub mod monitor;
 pub mod theme;

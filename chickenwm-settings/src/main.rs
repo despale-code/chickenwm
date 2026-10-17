@@ -273,6 +273,36 @@ impl SettingsApp {
         };
     }
 
+    /// Turns "start as administrator" on or off. Registering the scheduled task needs one UAC
+    /// approval; afterwards the shell starts elevated at every sign-in without a prompt.
+    fn apply_run_as_admin(&mut self, enable: bool) {
+        let exe = match std::env::current_exe() {
+            Ok(mut p) => {
+                p.set_file_name("chickenwm-rooster.exe");
+                p
+            }
+            Err(e) => {
+                self.status_banner = format!("Couldn't find chickenwm-rooster.exe: {e}");
+                return;
+            }
+        };
+        let flag = if enable { "--install-admin-task" } else { "--remove-admin-task" };
+        match chickenwm_core::elevation::run_elevated(&exe, &[flag], true) {
+            Ok(0) => {
+                self.cfg.misc.run_as_admin = enable;
+                self.doc.set_category_key("misc", "run_as_admin", bool_str(enable));
+                self.sync_config_and_notify();
+                self.status_banner = if enable {
+                    "ChickenWM will start as administrator at your next sign-in".to_string()
+                } else {
+                    "ChickenWM will start normally again".to_string()
+                };
+            }
+            Ok(code) => self.status_banner = format!("Couldn't change the administrator task (code {code})"),
+            Err(_) => self.status_banner = "Administrator approval was cancelled".to_string(),
+        }
+    }
+
     /// Applies the edited theme everywhere and records it in chickenwm.conf.
     fn apply_system_theme(&mut self) {
         let theme = self.theme_editor.draft.clone();
@@ -311,6 +341,35 @@ impl SettingsApp {
         if shell_changed {
             self.sync_config_and_notify();
             self.send_shell_config();
+        }
+
+        let mut want_admin = self.cfg.misc.run_as_admin;
+        let mut restart_admin = false;
+        let elevated = chickenwm_core::elevation::is_elevated();
+        kit::group(ui, kit, "Administrator", |g| {
+            g.row("Run ChickenWM as administrator", "Starts elevated at every sign-in, so windows of administrator programs can be tiled. Asks for approval once. Apps you launch from ChickenWM also run as administrator.", |ui| {
+                kit::toggle(ui, kit, &mut want_admin);
+            });
+            g.row("Status", "", |ui| {
+                if !elevated && kit::button(ui, kit, "Restart as administrator", true).clicked() {
+                    restart_admin = true;
+                }
+                if elevated {
+                    kit::chip(ui, kit, "● Running as administrator", Color32::from_rgb(52, 199, 89));
+                } else {
+                    kit::chip(ui, kit, "Normal privileges", kit.sub);
+                }
+            });
+        });
+        if want_admin != self.cfg.misc.run_as_admin {
+            self.apply_run_as_admin(want_admin);
+        }
+        if restart_admin {
+            self.status_banner = match send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::RestartElevated) {
+                Ok(chickenwm_core::ipc::IpcResponse::Error { message }) => format!("Not restarted: {message}"),
+                Ok(_) => "Restarting ChickenWM as administrator".to_string(),
+                Err(_) => "ChickenWM isn't running".to_string(),
+            };
         }
 
         let mut want = self.cfg.misc.register_files_handler;
@@ -690,6 +749,7 @@ impl SettingsApp {
                 PIPE_NAME_DAEMON,
                 &IpcCommand::SetCompositorMode { dwm_hook_enabled: self.cfg.misc.dwm_hook_enabled },
             );
+            self.status_banner = "Compositor engine changed: ChickenWM modules restarted".to_string();
         }
     }
 

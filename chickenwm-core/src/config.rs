@@ -848,6 +848,10 @@ pub struct MiscConfig {
     pub suppress_explorer: bool,
     pub replace_winlogon_shell: bool,
     pub register_files_handler: bool,
+    /// Start ChickenWM with administrator rights (via a one-time-approved scheduled task) so
+    /// windows of elevated programs can be tiled.
+    #[serde(default)]
+    pub run_as_admin: bool,
     /// Phase 1.1 & 9.3: Anti-Cheat Safe Switch (`false` = Standard Win32/DirectComposition mode; `true` = Experimental `chickenwm-dwm-hook` PDB injection).
     pub dwm_hook_enabled: bool,
     /// Window classes resized with a GPU-stretched preview during mouse drags (one real resize
@@ -868,6 +872,7 @@ impl Default for MiscConfig {
             suppress_explorer: true,
             replace_winlogon_shell: false,
             register_files_handler: false,
+            run_as_admin: false,
             dwm_hook_enabled: false,
             resize_preview_classes: default_resize_preview_classes(),
         }
@@ -1480,6 +1485,11 @@ impl HyprConfig {
                         self.misc.register_files_handler = b;
                     }
                 }
+                "run_as_admin" => {
+                    if let Some(b) = parse_bool(v) {
+                        self.misc.run_as_admin = b;
+                    }
+                }
                 "dwm_hook_enabled" | "compositor_hook" => {
                     if let Some(b) = parse_bool(v) {
                         self.misc.dwm_hook_enabled = b;
@@ -1764,6 +1774,8 @@ misc {
     suppress_explorer = true
     replace_winlogon_shell = false
     register_files_handler = false
+    # Start elevated (administrator) so admin windows can be tiled; toggle it in Settings
+    run_as_admin = false
     # Anti-Cheat Safe Switch: false = Standard Win32/DirectComposition mode, true = Experimental uDWM PDB Hook
     dwm_hook_enabled = false
     # Window classes resized with a stretched GPU preview while dragging (real resize on release)
