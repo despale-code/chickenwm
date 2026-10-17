@@ -76,7 +76,14 @@ ChickenWM is a Cargo workspace of small programs that talk to each other over a 
 
 ## Installation
 
-There are no prebuilt releases yet; you build from source.
+### Prebuilt
+
+Download `chickenwm-<version>-windows-x64.zip` from
+[Releases](https://github.com/despale-code/chickenwm/releases), extract it to a folder such as
+`%LOCALAPPDATA%\ChickenWM`, and start `chickenwm-rooster.exe`. Keep all the files together in
+that folder.
+
+### From source
 
 ```powershell
 git clone https://github.com/despale-code/chickenwm.git
