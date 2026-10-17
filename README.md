@@ -53,11 +53,12 @@ ChickenWM is a Cargo workspace of small programs that talk to each other over a 
 | `chickenwm-rooster.exe` | The daemon. Starts and watches the other modules (restarting them if they crash), hosts the IPC server and the system tray, keeps `explorer.exe` away if you ask it to, and runs the emergency failsafe. |
 | `chickenwm-wm.exe` | The tiling window manager: dwindle and master layouts, workspaces 1–10, gaps, borders, rounded corners, animations, window rules. |
 | `chickenwm-binds.exe` | Global hotkeys and mouse bindings from `chickenwm.conf`. |
-| `chickenwm-paper.exe` | Wallpapers: images (PNG/JPEG/WebP) or live WGSL shaders, with transitions. Without one, it draws a background generated from your theme. |
-| `roobar.exe` | The status bar: workspaces, active window title, clock, CPU, memory, layout. Floating "islands" style. |
-| `chickenwm-launcher.exe` | Fuzzy app launcher (rofi-style). Also a calculator, shell-command runner, window switcher and power menu. |
+| `chickenwm-paper.exe` | Wallpapers: images (PNG/JPEG/WebP) or live WGSL shaders, with transitions, or a stack of layers with blend modes and chroma keying. Without one, it draws a background generated from your theme. |
+| `chickenwm-notify.exe` | Notifications: toasts in a screen corner (Windows app notifications, tray balloons, `chickenctl notify`), a notification center with history on `Super` + `N`, do-not-disturb and per-app blocking. |
+| `roobar.exe` | The status bar: workspaces, active window title, clock, CPU, memory, layout. Flat floating "islands". |
+| `chickenwm-launcher.exe` | Fuzzy app launcher with its own card design. Also a calculator, shell-command runner, window switcher and power menu. |
 | `chickenwm-files.exe` | File explorer: details/icons/columns/dual-pane views, tabs, previews, real context menus, drag and drop, Recycle Bin, Explorer-compatible copy/paste. Can be made the system-wide default file manager. |
-| `chickenwm-settings.exe` | Settings app that edits `chickenwm.conf` without destroying your formatting, plus the theme editor, CSS editor, bezier curve editor, keybind recorder and window-rule inspector. |
+| `chickenwm-settings.exe` | Settings app in the style of macOS System Settings (searchable sidebar, grouped cards). Edits `chickenwm.conf` without destroying your formatting; has the theme gallery, CSS editor, bezier curve editor, shortcut recorder and window-rule inspector. `--page appearance` opens a page directly. |
 | `chickenbrowser.exe` | A lightweight browser on Microsoft Edge WebView2 with tabs, built-in ad/tracker blocking, Chromium extensions (Proton Pass works) and memory-saving options. |
 | `chickenctl.exe` | Command-line control: reload, dispatch commands, list windows/monitors, set wallpaper, change the theme, emergency restore. Modeled on Hyprland's `hyprctl`. |
 | `chickenwm-dwm-hook.exe` | **Experimental, off by default.** Injects into `dwm.exe` for lower-latency effects. Can trip anti-cheat software; leave it off if you play online games. |
@@ -174,6 +175,7 @@ open in Explorer, because only Explorer can display them.
 | `Super` + `E` | File explorer |
 | `Super` + `D` or `Alt` + `Space` | Launcher |
 | `Super` + `I` | Settings |
+| `Super` + `N` | Notification center |
 | `Super` + `V` | Toggle floating |
 | `Super` + `F` | Fullscreen |
 | `Super` + `P` | Pseudo-tile |
@@ -215,6 +217,7 @@ theme {
     accent = rgb(242321)        # one color themes everything, see docs/STYLING.md
     mode = light                # or dark
     icon_theme = chickenwm      # chickenwm (built-in), system, or your own pack
+    app_modes = browser:dark    # optional per-app light/dark; others follow mode
 }
 
 decoration {
@@ -282,7 +285,7 @@ reads the class and title of any window you click.
 | `movetoworkspace`, `movetoworkspacesilent` | `1`–`10` |
 | `resizeactive`, `moveactive` | `dx dy` in pixels, e.g. `-40 0` |
 | `layout` | `dwindle` or `master` |
-| `launcher`, `settings` | – |
+| `launcher`, `settings`, `notifications` | – (`notifications` toggles the notification center) |
 | `files` | optional folder to open |
 | `exit` | – (quit ChickenWM) |
 
@@ -296,7 +299,10 @@ chickenctl status                          daemon and module status
 chickenctl fps <n>                         frame rate target (0 = monitor refresh rate)
 chickenctl launcher                        open the launcher
 chickenctl wallpaper <path> [-m MONITOR] [-t fade|wipe|outer|grow]
-chickenctl theme ["#rrggbb"] [--mode light|dark] [--icons NAME]
+chickenctl theme ["#rrggbb"] [--mode light|dark] [--preset NAME|none] [--icons NAME]
+chickenctl notify "title" ["body"] [--app NAME] [--timeout SECS] [--critical]
+chickenctl notifications                   toggle the notification center
+chickenctl render-wallpaper <out.png>      generated wallpaper for any theme/size
 chickenctl restore-explorer                emergency restore
 chickenctl restore-windows                 unhide windows from other workspaces
 ```
@@ -305,14 +311,25 @@ Add `-j` to any command for JSON output.
 
 ## Theming and icons
 
-One accent color themes the whole system: bar, launcher, file explorer, browser, settings, window
-borders and icons. The default is **`#242321`**, a warm charcoal, in **light** mode: surfaces are
-light tints of the same hue, and text and highlights use the accent itself. **Dark** mode uses the
-accent as the background, with its lighter counterpart for highlights.
+One theme colors the whole system: bar, launcher, file explorer, browser, settings, notifications,
+window borders and icons. The default ChickenWM theme is generated from one accent color,
+**`#242321`** (a warm charcoal), in **light** mode: surfaces are light tints of the same hue, and
+text and highlights use the accent itself. **Dark** mode uses the accent as the background, with
+its lighter counterpart for highlights.
 
-- **Settings → Appearance → System Theme**: color picker, light/dark, icon theme, live preview,
-  *Apply to whole system*.
-- **Command line**: `chickenctl theme "#3b5bdb" --mode dark`.
+Or pick one of 10 popular color schemes, each with a light and a dark variant: **Dracula**
+(Alucard / Dracula), **Catppuccin** (Latte / Mocha), **Nord**, **Gruvbox**, **Tokyo Night**
+(Day / Night), **Rosé Pine** (Dawn / Rosé Pine), **Solarized**, **One** (One Light / One Dark),
+**Everforest** and **Kanagawa** (Lotus / Wave).
+
+- **Settings → Appearance**: a gallery of all themes, light/dark, accent color (for the ChickenWM
+  theme) and icon theme. Changes apply to the whole system right away.
+- **Command line**: `chickenctl theme --preset catppuccin --mode dark`, `chickenctl theme "#3b5bdb"`
+  (back to a generated theme), or one app: `chickenctl theme --app browser --app-mode dark`.
+- **In the config**: `theme { preset = nord }` (`none` = generated from `accent`).
+- **Per-app light/dark**: every app can follow the system mode or be light or dark on its own;
+  the same option is in each app's settings and in one table in ChickenWM Settings, all stored as
+  `app_modes` by one master color provider.
 - **Icon themes**: `chickenwm` (built-in, redrawn from your accent), `system` (Windows icons), or
   your own PNG pack in `.config\chickenwm\icons\<name>\`.
 
@@ -332,16 +349,61 @@ To use your own image, drop it in `.config\chickenwm\bg\`, add `wallpaper = , C:
 to `chickenwm.conf`, or run `chickenctl wallpaper C:\path\image.png`. Images and live `.wgsl`
 shaders both work.
 
+You can also stack **layers**, bottom to top, each with its own fit, opacity, blend mode and an
+optional **chroma key** that turns a color (a green screen, say) transparent:
+
+```ini
+paper {
+    layer = image, ~/bg/sky.png
+    layer = image, ~/bg/character.png, key = rgb(00ff00), tolerance = 0.25, softness = 0.1
+    layer = color, rgba(0, 0, 0, 0.25), blend = multiply
+}
+```
+
+All the options are in [docs/STYLING.md](docs/STYLING.md#wallpaper-layers).
+
 Everything about styling (every CSS variable of every module, how the palette is derived, and how
 to make icon packs) is in **[docs/STYLING.md](docs/STYLING.md)**.
+
+## Notifications
+
+`chickenwm-notify` shows notifications as cards in a corner of the screen and keeps a history.
+
+- **Where they come from**: Windows app notifications (Discord, Teams, browsers, Windows itself),
+  read through Windows' notification platform while Explorer isn't running; legacy tray-icon
+  balloons; and `chickenctl notify`. The first time, Windows may ask to let apps access your
+  notifications (Settings → Privacy & security → Notifications).
+- **On screen**: hover to pause the timers, click to dismiss, right-click for *Dismiss all* and
+  *Block notifications from <app>*. Critical notifications stay until dismissed.
+- **Notification center** (`Super` + `N`): past notifications, *Clear all*, *Do not disturb* (only
+  critical ones pop up), and your blocked apps (click one to unblock).
+- **Config**:
+
+```ini
+notifications {
+    position = top-right        # top-left | bottom-right | bottom-left | top-center | bottom-center
+    timeout = 6                 # seconds, 0 = until dismissed
+    max_visible = 4
+    margin_x = 16
+    margin_y = 12
+    windows_toasts = true
+    blocked = Discord, Steam    # apps whose notifications are dropped (also set from the menus)
+}
+```
+
+Styling (colors, size, radius, motion) is in `notifications.css`, see [docs/STYLING.md](docs/STYLING.md#notificationscss).
+History is kept in `.config\chickenwm\notifications.json`.
 
 ## The file explorer
 
 `chickenwm-files` (`Super` + `E`):
 
 - **Views**: Details (sortable columns), Icons, Columns (parent / current / preview), Dual pane.
-  Plus tabs, breadcrumbs (click to navigate, or type a path with `Ctrl` + `L`), search, a preview
-  pane with images and text, and a status bar with selection size and free disk space.
+  Plus tabs, breadcrumbs (click to navigate, or type a path with `Ctrl` + `L`), search, and a
+  status bar with selection size and free disk space.
+- **Preview**: a card that fills the preview pane or column: images fitted and centered (with a
+  checkerboard behind transparency), code with syntax highlighting and line numbers for ~30
+  languages, wrapped text, and folder contents.
 - **Right-click menus**: Open, Open with, Run as administrator, Extract, Cut/Copy/Paste, Copy as
   path, Rename, Delete (Recycle Bin) or Delete permanently, Compress to ZIP, Create shortcut, Pin to
   Quick access, Open in Terminal, Properties, and **Show more options** for the full Windows menu
@@ -365,6 +427,15 @@ to make icon packs) is in **[docs/STYLING.md](docs/STYLING.md)**.
   extension ID, so their web sign-in works.
 - **Memory & performance** (`about:settings`): presets (Balanced / Memory saver / Maximum
   savings), background-tab suspension and unloading, renderer process limits, and live memory usage.
+- **Appearance** (`about:settings`): *Dark mode* (same accent palette) or *Follow ChickenWM theme*,
+  *Match website colors* (the toolbar follows each page's background), vertical tabs (collapsible,
+  or *auto-hide*: tucks into a thin strip and slides out over the page when you hover the left
+  edge), tab icons, and animations (the browser's own switch, independent of Windows' animation
+  setting).
+- **When a site breaks**: click the shield in the address bar to turn ad blocking off for that
+  site. Edge's tracking prevention defaults to *Basic* (changeable under Privacy), since stricter
+  levels can break sign-in pages. Pop-up windows that sites open with `window.open` (sign-in,
+  payment, exams) open as real pop-ups so they keep working.
 
 ## Building and developing
 
@@ -399,6 +470,11 @@ Logs go to stdout; run a module from a terminal to see them. Set `RUST_LOG=debug
 - **A window refuses to tile**: some apps (games, installers, UWP popups) are skipped on purpose.
   Force it with `windowrulev2 = float, class:^(...)$`, or pick it with the crosshair in Settings →
   Window Rules.
+- **Task Manager or another admin window floats**: Windows doesn't let a normal program move the
+  windows of a program running as administrator. ChickenWM leaves those windows floating and shows
+  a notification. Run rooster as administrator to tile them too.
+- **Windows on other workspaces**: they are moved far off-screen ("parked") instead of hidden, so
+  Task Manager still groups them under their app. Exiting ChickenWM puts them all back.
 - **The browser doesn't start**: install the
   [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and keep
   `WebView2Loader.dll` next to `chickenbrowser.exe`.

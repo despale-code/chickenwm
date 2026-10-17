@@ -17,6 +17,7 @@ pub mod icon_theme;
 pub mod ipc;
 pub mod monitor;
 pub mod theme;
+pub mod theme_presets;
 pub mod wallpaper;
 
 use anyhow::Result;
@@ -42,7 +43,7 @@ pub fn bootstrap_config_and_themes() -> Result<(config::ConfigDocument, config::
     css::ensure_default_css_files()?;
     let (doc, cfg) = config::load_or_init_config()?;
     // Freshly created CSS files start from the configured theme, not the stock defaults.
-    let palette = theme::Palette::new(cfg.theme.accent, cfg.theme.mode);
+    let palette = cfg.theme.palette(cfg.theme.mode);
     for f in missing {
         let _ = theme::apply_palette_to_file(&palette, &dir.join(f));
     }

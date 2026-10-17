@@ -8,6 +8,7 @@ members = [
     "chickenwm-paper",
     "chickenwm-launcher",
     "chickenwm-files",
+    "chickenwm-notify",
     "chickenwm-settings",
     "chickenwm-dwm-hook",
     "roobar",

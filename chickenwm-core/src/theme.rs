@@ -59,6 +59,14 @@ pub struct ThemeConfig {
     /// `system` (Windows shell icons), `chickenwm` (built-in, tinted from the palette), or the
     /// name of a folder under `~/.config/chickenwm/icons/`.
     pub icon_theme: String,
+    /// Per-app light/dark choice (`app_modes = browser:dark, files:light`); apps not listed
+    /// follow `mode`.
+    #[serde(default)]
+    pub app_modes: Vec<(String, AppMode)>,
+    /// A built-in color scheme (`dracula`, `catpuccin`, … see `theme_presets`); empty means
+    /// the palette is generated from `accent`.
+    #[serde(default)]
+    pub preset: String,
 }
 
 impl Default for ThemeConfig {
@@ -67,8 +75,116 @@ impl Default for ThemeConfig {
             accent: DEFAULT_ACCENT,
             mode: ThemeMode::Light,
             icon_theme: "chickenwm".to_string(),
+            app_modes: Vec::new(),
+            preset: String::new(),
         }
     }
+}
+
+/// An app's light/dark choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppMode {
+    /// Use the system `mode`.
+    System,
+    Light,
+    Dark,
+}
+
+impl AppMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" | "auto" | "follow" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+/// Every themed app: (id used in `app_modes`, its stylesheet, display name).
+pub const APPS: [(&str, &str, &str); 6] = [
+    ("roobar", "roobar.css", "Status bar"),
+    ("launcher", "launcher.css", "Launcher"),
+    ("files", "files.css", "File explorer"),
+    ("settings", "settings.css", "Settings"),
+    ("browser", "browser.css", "Browser"),
+    ("notifications", "notifications.css", "Notifications"),
+];
+
+impl ThemeConfig {
+    /// The app's own choice (`System` if it has none).
+    pub fn app_mode(&self, app: &str) -> AppMode {
+        self.app_modes
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(app))
+            .map_or(AppMode::System, |(_, m)| *m)
+    }
+
+    /// The light/dark mode an app actually uses.
+    pub fn mode_for(&self, app: &str) -> ThemeMode {
+        match self.app_mode(app) {
+            AppMode::System => self.mode,
+            AppMode::Light => ThemeMode::Light,
+            AppMode::Dark => ThemeMode::Dark,
+        }
+    }
+
+    /// The master color provider: the palette an app should be drawn with.
+    pub fn palette_for(&self, app: &str) -> Palette {
+        self.palette(self.mode_for(app))
+    }
+
+    /// The palette for `mode`: the preset's, or the one generated from the accent.
+    pub fn palette(&self, mode: ThemeMode) -> Palette {
+        match crate::theme_presets::find(&self.preset) {
+            Some(p) if !self.preset.is_empty() => p.palette(mode),
+            _ => Palette::new(self.accent, mode),
+        }
+    }
+
+    pub fn set_app_mode(&mut self, app: &str, mode: AppMode) {
+        self.app_modes.retain(|(a, _)| !a.eq_ignore_ascii_case(app));
+        if mode != AppMode::System {
+            self.app_modes.push((app.to_ascii_lowercase(), mode));
+        }
+    }
+
+    /// `browser:dark, files:light` for chickenwm.conf.
+    pub fn app_modes_string(&self) -> String {
+        self.app_modes
+            .iter()
+            .map(|(a, m)| format!("{a}:{}", m.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn parse_app_modes(value: &str) -> Vec<(String, AppMode)> {
+        value
+            .split(',')
+            .filter_map(|pair| {
+                let (app, mode) = pair.split_once(':')?;
+                Some((app.trim().to_ascii_lowercase(), AppMode::parse(mode)?))
+            })
+            .filter(|(app, m)| !app.is_empty() && *m != AppMode::System)
+            .collect()
+    }
+}
+
+/// Stylesheet of an app id, or the app id of a stylesheet.
+pub fn app_file(app: &str) -> Option<&'static str> {
+    APPS.iter().find(|(id, _, _)| id.eq_ignore_ascii_case(app)).map(|(_, f, _)| *f)
+}
+
+fn app_of_file(file: &str) -> Option<&'static str> {
+    APPS.iter().find(|(_, f, _)| f.eq_ignore_ascii_case(file)).map(|(id, _, _)| *id)
 }
 
 // ───────────────────────────── color math ─────────────────────────────
@@ -301,13 +417,6 @@ impl Palette {
                 ("--accent-secondary", c(p.accent_soft)),
                 ("--selected-bg", c(p.selected)),
                 ("--border-color", c(p.border)),
-                // The launcher's rofi-style renderer reads these.
-                ("--rofi-background", c(p.surface)),
-                ("--rofi-foreground", c(p.fg)),
-                ("--rofi-lightbg", c(p.mantle)),
-                ("--rofi-lightfg", c(p.subtext)),
-                ("--rofi-selected-bg", c(p.accent)),
-                ("--rofi-selected-fg", c(p.accent_fg)),
             ],
             "settings.css" => vec![
                 ("--bg-color", c(p.base)),
@@ -337,6 +446,16 @@ impl Palette {
                 ("--ws-occupied-fg", c(p.fg)),
                 ("--ws-empty-fg", c(p.faint)),
             ],
+            "notifications.css" => vec![
+                ("--card-bg", c(with_alpha(p.surface, 0.97))),
+                ("--fg-color", c(p.fg)),
+                ("--subtext-color", c(p.subtext)),
+                ("--accent-color", c(p.accent)),
+                ("--accent-fg", c(p.accent_fg)),
+                ("--border-color", c(p.border)),
+                ("--shadow-color", c(p.shadow)),
+                ("--critical-color", c(p.danger)),
+            ],
             "browser.css" => vec![
                 ("--bg-color", c(p.base)),
                 ("--tab-strip-bg", c(p.mantle)),
@@ -364,8 +483,8 @@ impl Palette {
     }
 }
 
-pub const THEMED_CSS_FILES: [&str; 5] =
-    ["files.css", "launcher.css", "settings.css", "roobar.css", "browser.css"];
+pub const THEMED_CSS_FILES: [&str; 6] =
+    ["files.css", "launcher.css", "settings.css", "roobar.css", "browser.css", "notifications.css"];
 
 /// Sets `--name: value;` declarations inside the first `:root { }` block, keeping everything
 /// else (other variables, comments, rules) untouched. Missing variables are appended to the
@@ -441,15 +560,55 @@ pub fn apply_palette_to_file(palette: &Palette, path: &Path) -> Result<bool> {
 
 /// Applies a theme to every module's CSS (and regenerates the built-in icon theme). The caller
 /// persists `theme { }` and `col.active_border` in `chickenwm.conf` through its `ConfigDocument`.
+///
+/// Each app gets the palette for *its* mode (`app_modes`); the returned palette is the system
+/// one (window borders, icons, wallpaper).
 pub fn apply_theme(theme: &ThemeConfig) -> Result<Palette> {
-    let palette = Palette::new(theme.accent, theme.mode);
+    let palette = theme.palette(theme.mode);
     let dir = config_dir();
     crate::css::ensure_default_css_files()?;
     for file in THEMED_CSS_FILES {
-        apply_palette_to_file(&palette, &dir.join(file))?;
+        let app_palette = app_of_file(file).map_or(palette, |app| theme.palette_for(app));
+        apply_palette_to_file(&app_palette, &dir.join(file))?;
     }
     crate::icon_theme::generate_builtin(&palette)?;
     Ok(palette)
+}
+
+/// Sets one app's light/dark mode, saves it in chickenwm.conf and repaints that app (its
+/// stylesheet hot-reloads). This is what every app's "Appearance" option calls.
+pub fn set_app_mode(app: &str, mode: AppMode) -> Result<ThemeConfig> {
+    let (mut doc, cfg) = crate::config::load_or_init_config()?;
+    let mut theme = cfg.theme;
+    theme.set_app_mode(app, mode);
+    doc.set_category_key("theme", "app_modes", &theme.app_modes_string());
+    crate::config::save_config_document(&doc)?;
+    if let Some(file) = app_file(app) {
+        apply_palette_to_file(&theme.palette_for(app), &config_dir().join(file))?;
+    }
+    Ok(theme)
+}
+
+/// The canonical id of a preset name (`"Tokyo Night"` → `tokyonight`).
+pub fn theme_preset_id(name: &str) -> Option<String> {
+    crate::theme_presets::find(name).map(|p| p.id.to_string())
+}
+
+/// Records `theme { }` (and the window border that follows it) in chickenwm.conf.
+pub fn write_theme_keys(doc: &mut crate::config::ConfigDocument, theme: &ThemeConfig, palette: &Palette) {
+    doc.set_category_key("theme", "accent", &hypr_rgb(theme.accent));
+    doc.set_category_key("theme", "mode", theme.mode.as_str());
+    doc.set_category_key("theme", "preset", if theme.preset.is_empty() { "none" } else { &theme.preset });
+    doc.set_category_key("theme", "icon_theme", &theme.icon_theme);
+    doc.set_category_key("theme", "app_modes", &theme.app_modes_string());
+    doc.set_category_key("general", "col.active_border", &hypr_color(palette.active_border()));
+}
+
+/// Every app's current setting, for settings UIs: (id, display name, choice, effective mode).
+pub fn app_mode_table(theme: &ThemeConfig) -> Vec<(&'static str, &'static str, AppMode, ThemeMode)> {
+    APPS.iter()
+        .map(|(id, _, name)| (*id, *name, theme.app_mode(id), theme.mode_for(id)))
+        .collect()
 }
 
 /// `rgba(rrggbbaa)` for `chickenwm.conf`.
@@ -493,6 +652,22 @@ mod tests {
         // A bright seed still yields a readable light theme.
         let cyan = Palette::new(RgbaColor { r: 51, g: 204, b: 255, a: 255 }, ThemeMode::Light);
         assert!(contrast(cyan.accent, cyan.base) >= 3.0);
+    }
+
+    #[test]
+    fn per_app_modes() {
+        let mut t = ThemeConfig::default();
+        assert_eq!(t.mode_for("browser"), ThemeMode::Light);
+        t.set_app_mode("browser", AppMode::Dark);
+        t.set_app_mode("files", AppMode::Light);
+        t.set_app_mode("files", AppMode::System); // back to following
+        assert_eq!(t.mode_for("browser"), ThemeMode::Dark);
+        assert_eq!(t.mode_for("files"), ThemeMode::Light);
+        assert_eq!(t.app_modes_string(), "browser:dark");
+        assert_eq!(ThemeConfig::parse_app_modes("Browser:dark, files : light, bogus, x:weird"),
+            vec![("browser".to_string(), AppMode::Dark), ("files".to_string(), AppMode::Light)]);
+        t.mode = ThemeMode::Dark;
+        assert_eq!(t.palette_for("launcher").mode, ThemeMode::Dark);
     }
 
     #[test]

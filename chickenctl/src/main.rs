@@ -74,7 +74,32 @@ enum Commands {
         /// Icon theme: `system`, `chickenwm` or a folder name under `~/.config/chickenwm/icons`.
         #[arg(short, long)]
         icons: Option<String>,
+        /// Color scheme: dracula, catppuccin, nord, gruvbox, tokyonight, rosepine, solarized, one,
+        /// everforest, kanagawa; `none` = generate from the accent.
+        #[arg(short, long)]
+        preset: Option<String>,
+        /// Set one app's light/dark instead: `--app browser --app-mode dark` (`system` = follow).
+        #[arg(long, requires = "app_mode")]
+        app: Option<String>,
+        #[arg(long)]
+        app_mode: Option<String>,
     },
+    /// Show a notification (`chickenctl notify "Backup done" "42 files copied" --app Robocopy`).
+    Notify {
+        title: String,
+        #[arg(default_value = "")]
+        body: String,
+        #[arg(short, long, default_value = "chickenctl")]
+        app: String,
+        /// Seconds on screen (0 = until dismissed).
+        #[arg(short, long)]
+        timeout: Option<u32>,
+        /// Stays until dismissed and ignores do-not-disturb.
+        #[arg(long)]
+        critical: bool,
+    },
+    /// Show / hide the notification center (same as Super+N).
+    Notifications,
     /// Render the generated theme wallpaper to a PNG (defaults: current theme, 3840x2160).
     RenderWallpaper {
         /// Output PNG path.
@@ -103,11 +128,20 @@ async fn main() -> Result<()> {
             println!("ok: explorer.exe restored as default shell and launched.");
             return Ok(());
         }
-        Commands::Theme { accent, mode, icons } => {
+        Commands::Theme { accent, mode, icons, preset, app, app_mode } => {
             use chickenwm_core::theme;
+            if let (Some(app), Some(m)) = (app, app_mode) {
+                let m = theme::AppMode::parse(&m).with_context(|| format!("app mode must be system, light or dark, not {m}"))?;
+                if theme::app_file(&app).is_none() {
+                    anyhow::bail!("unknown app {app}; one of: {}", theme::APPS.iter().map(|a| a.0).collect::<Vec<_>>().join(", "));
+                }
+                let t = theme::set_app_mode(&app, m)?;
+                println!("ok: {app} → {} (uses {})", m.as_str(), t.mode_for(&app).as_str());
+                return Ok(());
+            }
             let (mut doc, cfg) = chickenwm_core::bootstrap_config_and_themes()?;
             let mut t = cfg.theme.clone();
-            if let Some(a) = accent {
+            if let Some(a) = &accent {
                 t.accent = chickenwm_core::config::RgbaColor::parse(a.trim())
                     .map(|c| chickenwm_core::config::RgbaColor { a: 255, ..c })
                     .with_context(|| format!("not a color: {a}"))?;
@@ -118,25 +152,55 @@ async fn main() -> Result<()> {
             if let Some(i) = icons {
                 t.icon_theme = i;
             }
+            if let Some(p) = preset {
+                t.preset = if p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("chickenwm") {
+                    String::new()
+                } else {
+                    theme::theme_preset_id(&p).with_context(|| {
+                        format!("unknown preset {p}; one of: {}", chickenwm_core::theme_presets::PRESETS.iter().map(|p| p.id).collect::<Vec<_>>().join(", "))
+                    })?
+                };
+            } else if accent.is_some() {
+                // A new accent means the generated theme.
+                t.preset.clear();
+            }
             let palette = theme::apply_theme(&t)?;
-            doc.set_category_key("theme", "accent", &theme::hypr_rgb(t.accent));
-            doc.set_category_key("theme", "mode", t.mode.as_str());
-            doc.set_category_key("theme", "icon_theme", &t.icon_theme);
-            doc.set_category_key("general", "col.active_border", &theme::hypr_color(palette.active_border()));
+            theme::write_theme_keys(&mut doc, &t, &palette);
             chickenwm_core::config::save_config_document(&doc)?;
             let _ = send_ipc_command(&IpcCommand::ReloadConfig).await;
             if cli.json {
                 println!("{}", serde_json::json!({
-                    "accent": theme::css(t.accent), "mode": t.mode.as_str(), "icon_theme": t.icon_theme,
+                    "accent": theme::css(t.accent), "mode": t.mode.as_str(), "preset": t.preset, "icon_theme": t.icon_theme,
                     "base": theme::css(palette.base), "surface": theme::css(palette.surface),
                     "fg": theme::css(palette.fg), "accent_fg": theme::css(palette.accent_fg),
                 }));
             } else {
-                println!("ok: theme {} ({}), icons {}", theme::css(t.accent), t.mode.as_str(), t.icon_theme);
+                let scheme = if t.preset.is_empty() { theme::css(t.accent) } else { t.preset.clone() };
+                println!("ok: theme {scheme} ({}), icons {}", t.mode.as_str(), t.icon_theme);
                 println!("    base {}  surface {}  text {}  accent {}  on-accent {}",
                     theme::css(palette.base), theme::css(palette.surface), theme::css(palette.fg),
                     theme::css(palette.accent), theme::css(palette.accent_fg));
             }
+            return Ok(());
+        }
+        Commands::Notify { title, body, app, timeout, critical } => {
+            let note = chickenwm_core::ipc::Notification {
+                app,
+                title,
+                body,
+                timeout_secs: timeout,
+                urgency: critical.then(|| "critical".to_string()),
+            };
+            let resp = chickenwm_core::ipc::send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &IpcCommand::Notify(note))
+                .await
+                .context("chickenwm-notify isn't running")?;
+            println!("{resp:?}");
+            return Ok(());
+        }
+        Commands::Notifications => {
+            chickenwm_core::ipc::send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter)
+                .await
+                .context("chickenwm-notify isn't running")?;
             return Ok(());
         }
         Commands::RenderWallpaper { out, width, height, accent, mode } => {
@@ -196,7 +260,7 @@ async fn main() -> Result<()> {
             path,
             transition: Some(transition),
         },
-        Commands::Monitors | Commands::RestoreExplorer | Commands::RestoreWindows | Commands::Theme { .. } | Commands::RenderWallpaper { .. } => unreachable!(),
+        Commands::Monitors | Commands::RestoreExplorer | Commands::RestoreWindows | Commands::Theme { .. } | Commands::RenderWallpaper { .. } | Commands::Notify { .. } | Commands::Notifications => unreachable!(),
     };
 
     let response = send_ipc_command(&ipc_cmd).await?;

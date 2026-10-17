@@ -159,6 +159,55 @@ pub fn clear_hidden_by_chickenwm(hwnd: u64) {
     }
 }
 
+/// Where windows of inactive workspaces are parked (far left of any monitor layout; not
+/// -32000, which Windows uses for minimized windows).
+pub const PARK_X: i32 = -30000;
+const PARK_POS_PROP: &str = "ChickenWMParkedPos";
+
+/// Parks `hwnd` off-screen for an inactive workspace instead of hiding it. The window stays
+/// "visible" to Windows (Task Manager keeps it under Apps with its child processes; the app
+/// isn't told it was hidden). Its on-screen position is saved on the window, so
+/// [`restore_all_desktop_windows`] can bring it back even if the WM was killed.
+pub fn park_window(hwnd: u64) {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetPropW, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+    let h = HWND(hwnd as *mut core::ffi::c_void);
+    let prop = to_wide_null(PARK_POS_PROP);
+    unsafe {
+        let mut rc = RECT::default();
+        if GetWindowRect(h, &mut rc).is_err() {
+            return;
+        }
+        if rc.left > PARK_X + 5000 {
+            // Not parked yet: remember where it was (x and y packed into the handle value).
+            let packed = ((rc.left as i64 + 0x8000_0000) << 32) | (rc.top as i64 + 0x8000_0000);
+            let _ = SetPropW(h, PCWSTR(prop.as_ptr()), HANDLE(packed as usize as *mut core::ffi::c_void));
+        }
+        let _ = SetWindowPos(h, None, PARK_X, rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    mark_hidden_by_chickenwm(hwnd);
+}
+
+/// The position saved by [`park_window`] (and forgets it).
+fn take_parked_position(hwnd: windows::Win32::Foundation::HWND) -> Option<(i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetPropW, RemovePropW};
+    let prop = to_wide_null(PARK_POS_PROP);
+    unsafe {
+        let v = GetPropW(hwnd, PCWSTR(prop.as_ptr())).0 as usize as i64;
+        if v == 0 {
+            return None;
+        }
+        let _ = RemovePropW(hwnd, PCWSTR(prop.as_ptr()));
+        Some((((v >> 32) - 0x8000_0000) as i32, ((v & 0xFFFF_FFFF) - 0x8000_0000) as i32))
+    }
+}
+
+/// Clears the parking marks when the WM brings a window back itself (it lays it out anew).
+pub fn unpark_window(hwnd: u64) {
+    let _ = take_parked_position(windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void));
+    clear_hidden_by_chickenwm(hwnd);
+}
+
 /// Unhides and restores the windows HyperWin hid on inactive workspaces, e.g. after chickenwm-wm
 /// or chickenwm-rooster was shut down or killed. Only windows tagged by [`mark_hidden_by_chickenwm`]
 /// are touched — tray-hidden apps and hidden system helper windows stay hidden.
@@ -189,6 +238,10 @@ pub fn restore_all_desktop_windows() -> usize {
                 return BOOL(1);
             }
             let _ = RemovePropW(hwnd, prop);
+            if let Some((x, y)) = take_parked_position(hwnd) {
+                use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+                let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             } else {
@@ -259,7 +312,7 @@ fn claim_restore_mutex() -> (Option<HANDLE>, bool) {
 
 /// PIDs of running processes whose image name matches one of `names` (case-insensitive),
 /// excluding the current process.
-fn find_process_ids(names: &[&str]) -> Vec<u32> {
+pub fn find_process_ids(names: &[&str]) -> Vec<u32> {
     let mut pids = Vec::new();
     unsafe {
         let own_pid = GetCurrentProcessId();

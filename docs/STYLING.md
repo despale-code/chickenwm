@@ -24,9 +24,11 @@ Icons are themed separately, with **icon themes** (see [Icon themes](#icon-theme
   - [files.css](#filescss): file explorer
   - [settings.css](#settingscss): settings app
   - [browser.css](#browsercss): browser
+  - [notifications.css](#notificationscss): notifications
 - [Window borders](#window-borders)
 - [Icon themes](#icon-themes)
 - [Wallpaper](#wallpaper)
+  - [Wallpaper layers](#wallpaper-layers)
 - [CSS support](#css-support)
 - [Recipes](#recipes)
 
@@ -38,13 +40,54 @@ The theme lives in `chickenwm.conf`:
 theme {
     accent = rgb(242321)    # the seed color
     mode = light            # light | dark
+    preset = none           # none (generated from accent) | dracula | catppuccin | nord | gruvbox
+                            # | tokyonight | rosepine | solarized | one | everforest | kanagawa
     icon_theme = chickenwm  # chickenwm | system | <your pack>
+    app_modes = browser:dark, files:light   # optional per-app light/dark (others follow mode)
 }
 ```
+
+With a `preset`, the scheme's own colors fill the palette (its light variant in light mode, its dark
+one in dark mode) and `accent` is ignored. The derived colors (borders, hovers, selection) are
+computed from the scheme the same way as for the generated theme, and every preset is tested for
+readable text contrast (at least 4.5:1).
+
+| Preset | Light | Dark |
+|---|---|---|
+| `dracula` | Alucard | Dracula |
+| `catppuccin` | Latte | Mocha |
+| `nord` | Snow Storm | Polar Night |
+| `gruvbox` | Gruvbox Light | Gruvbox Dark |
+| `tokyonight` | Day | Night |
+| `rosepine` | Dawn | Rosé Pine |
+| `solarized` | Solarized Light | Solarized Dark |
+| `one` | One Light | One Dark |
+| `everforest` | Everforest Light | Everforest Dark |
+| `kanagawa` | Lotus | Wave |
 
 The default accent is **`#242321`**, a warm charcoal. In light mode it's the color of text and
 highlights on near-white surfaces that carry a hint of the same warm hue. In dark mode it becomes
 the background, and its lighter counterpart takes over the highlights.
+
+### One color provider, the same light/dark option everywhere
+
+ChickenWM has a single **master color provider** (the theme engine in `chickenwm-core`). Every
+app gets its colors from it; nothing keeps its own copy. Each app can follow the system mode or
+use light or dark on its own, and that choice is stored centrally in `app_modes`, so it's the
+same setting wherever you change it:
+
+| Where | Option |
+|---|---|
+| ChickenWM Settings → Appearance | **Per-app light / dark** table for every app |
+| Browser → `about:settings` → Appearance | **Dark mode** / **Follow ChickenWM theme** |
+| File explorer → ⚙ menu | **Appearance**: Follow system / Light / Dark |
+| Notification center (`Super` + `N`) | **◐** button |
+| Command line | `chickenctl theme --app <id> --app-mode system|light|dark` |
+
+App ids: `roobar`, `launcher`, `files`, `settings`, `browser`, `notifications`. Changing
+one repaints that app immediately (its stylesheet hot-reloads); changing the accent or system mode
+repaints every app in its own mode. The browser's *Match website colors* is the one live
+exception: it temporarily switches the browser's toolbar to suit the page.
 
 There are three ways to apply a theme. All three do the same thing:
 
@@ -57,7 +100,7 @@ There are three ways to apply a theme. All three do the same thing:
 Applying a theme:
 
 1. writes the palette into the color variables of `roobar.css`, `launcher.css`, `files.css`,
-   `settings.css` and `browser.css`;
+   `settings.css`, `browser.css` and `notifications.css`;
 2. sets `col.active_border` (the focused-window border) to the accent;
 3. redraws the built-in `chickenwm` icon theme in the new colors;
 4. saves `theme { }` in `chickenwm.conf`.
@@ -154,7 +197,7 @@ the theme leaves it alone.
 
 ### roobar.css
 
-The status bar. Each module (workspaces, window title, clock, CPU, memory…) is a floating island.
+The status bar. Each module (workspaces, window title, clock, CPU, memory…) is a flat floating island: a solid fill and a hairline border.
 
 | Variable | Theme | Meaning |
 |---|---|---|
@@ -165,7 +208,6 @@ The status bar. Each module (workspaces, window title, clock, CPU, memory…) is
 | `--accent-color` | accent_fg | Hover glow and active text |
 | `--accent-secondary` | subtext | Secondary labels |
 | `--border-color` | border | Island outline |
-| `--shadow-color` | shadow | Island shadow |
 | `--ws-active-bg` / `--ws-active-fg` | accent / accent_fg | Active workspace highlight (it slides between workspaces) |
 | `--ws-occupied-bg` / `--ws-occupied-fg` | translucent accent / fg | Workspaces with windows |
 | `--ws-empty-bg` / `--ws-empty-fg` | – / faint | Empty workspaces |
@@ -182,19 +224,26 @@ The status bar. Each module (workspaces, window title, clock, CPU, memory…) is
 
 ### launcher.css
 
-The launcher draws rofi's classic layout: a prompt line and a list of results.
+The launcher is a floating card: a large search field with a result count, rich result rows (icon,
+title, subtitle and a kind label: App, Window, Command, System, Calculator), a selection highlight
+that glides between rows with an accent edge, and a footer with key hints. It rises and fades in
+when it opens.
 
 | Variable | Theme | Meaning |
 |---|---|---|
-| `--rofi-background` | surface | Window and even-row background |
-| `--rofi-foreground` | fg | Text and window outline |
-| `--rofi-lightbg` | mantle | Odd-row (striped) background |
-| `--rofi-lightfg` | subtext | Secondary text |
-| `--rofi-selected-bg` | accent | Selected row background |
-| `--rofi-selected-fg` | accent_fg | Selected row text |
-| `--bg-color`, `--surface-color`, `--fg-color`, `--subtext-color`, `--accent-color`, `--accent-secondary`, `--selected-bg`, `--border-color` | base, surface, fg, subtext, accent, accent_soft, selected, border | Kept in sync for future layouts |
+| `--surface-color` | surface | Card background |
+| `--fg-color` | fg | Titles and typed text |
+| `--subtext-color` | subtext | Subtitles, hints, search icon |
+| `--accent-color` | accent | Selection edge and calculator result |
+| `--selected-bg` | selected | Selected row (hovered rows use it at half strength) |
+| `--border-color` | border | Card outline, dividers, icon placeholders |
+| `--border-radius` | – | Card corner radius (px, default 16) |
+| `--row-height` | – | Result row height (px, default 48) |
+| `--icon-size` | – | App icon size (px, default 32) |
+| `--font-size` | – | Title size (px, default 15); the search field is 6 px larger |
 
-Without the `--rofi-*` variables the launcher falls back to rofi's default Solarized-light colors.
+The theme also keeps `--bg-color` and `--accent-secondary` in sync, but the launcher doesn't use
+them. Shortcut icons come from the shortcut's target, so they don't carry the shortcut arrow.
 
 ### files.css
 
@@ -261,6 +310,28 @@ affected.
 | `--close-hover-bg`, `--close-hover-fg` | – | Window close button on hover |
 | `--font-family`, `--font-size` | – | Typography |
 | `--anim-duration`, `--anim-bezier` | – | Motion |
+
+### notifications.css
+
+Toasts and the notification center. Position, timeout and count are in `chickenwm.conf`
+(`notifications { }`); this file is the look.
+
+| Variable | Theme | Meaning |
+|---|---|---|
+| `--card-bg` | surface @ 97% | Card and center background |
+| `--fg-color` | fg | Titles |
+| `--subtext-color` | subtext | App name, time, body text |
+| `--accent-color` / `--accent-fg` | accent / accent_fg | App avatar, countdown line |
+| `--border-color` | border | Card outline |
+| `--shadow-color` | shadow | Card shadow |
+| `--critical-color` | danger | Outline and avatar of critical notifications |
+| `--card-width` | – | Card width (px, default 360) |
+| `--border-radius` | – | Corner radius (px, default 12) |
+| `--padding`, `--gap` | – | Inner padding and space between cards (px) |
+| `--title-size`, `--body-size`, `--app-size` | – | Text sizes (px) |
+| `--icon-size` | – | App avatar size (px, 0 hides it) |
+| `--anim-ms` | – | Slide/fade duration (default 320) |
+| `--progress-height` | – | Countdown line thickness (px, 0 hides it) |
 
 ## Window borders
 
@@ -349,6 +420,45 @@ Render your own:
 chickenctl render-wallpaper out.png                       # current theme, 3840×2160
 chickenctl render-wallpaper out.png --width 5120 --height 1440 --accent "#242321" --mode dark
 ```
+
+### Wallpaper layers
+
+A `paper { }` block stacks layers bottom to top and replaces the single `wallpaper =` line:
+
+```ini
+paper {
+    layer = image, ~/bg/sky.png
+    layer = image, ~/bg/character.png, key = rgb(00ff00), tolerance = 0.25, softness = 0.1
+    layer = shader, ~/shaders/rain.wgsl, opacity = 0.4, blend = screen
+    layer = color, rgba(0, 0, 0, 0.25), blend = multiply
+    layer = generated, opacity = 0.5
+}
+```
+
+Each line is `layer = kind, source, option = value, …`:
+
+| Kind | Source |
+|---|---|
+| `image` | A PNG / JPEG / WebP path. PNG transparency is kept. |
+| `color` | A color, `rgb(rrggbb)` or `rgba(r, g, b, a)`. |
+| `generated` | None: the theme's generated wallpaper. |
+| `shader` | Optional `.wgsl` path (checked for errors). The built-in animated aurora is drawn. |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `opacity` | `1` | 0–1 |
+| `blend` | `normal` | `normal`, `multiply`, `screen`, `add`, `overlay` |
+| `fit` | `cover` | `cover` (fill, crop), `contain` (fit inside), `stretch`, `center` (original size × `scale`), `tile` |
+| `scale` | `1` | Size factor for `center` and `tile` (and zoom for `cover`) |
+| `x`, `y` | `0.5` | Where the image sits or which part is kept when cropping: 0 = left/top, 1 = right/bottom |
+| `key` | – | Chroma key color: pixels close to it become transparent |
+| `tolerance` | `0.2` | How close (0–1, compared on color only, not brightness) a pixel must be to be removed |
+| `softness` | `0.1` | Width of the soft edge after `tolerance` |
+| `despill` | `true` | Removes the key color's tint from the edges that remain (green fringes) |
+
+Layers are prepared once when loaded, so a static stack costs nothing afterwards. Shader layers
+redraw every frame; the layers below the first shader are cached. A layer that fails to load is
+skipped with a warning in the log, and the rest still show.
 
 ## CSS support
 

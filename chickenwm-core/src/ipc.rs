@@ -13,6 +13,7 @@ pub const PIPE_NAME_WM: &str = r"\\.\pipe\chickenwm-wm-ipc";
 pub const PIPE_NAME_LAUNCHER: &str = r"\\.\pipe\chickenwm-launcher-ipc";
 pub const PIPE_NAME_PAPER: &str = r"\\.\pipe\chickenwm-paper-ipc";
 pub const PIPE_NAME_BAR: &str = r"\\.\pipe\chickenwm-bar-ipc";
+pub const PIPE_NAME_NOTIFY: &str = r"\\.\pipe\chickenwm-notify-ipc";
 
 /// Direction for focus / swap / move operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +100,8 @@ pub enum Action {
     OpenFiles(Option<String>),
     /// Open ChickenWM Settings GUI.
     OpenSettings,
+    /// Show / hide the notification center (`chickenwm-notify`).
+    ToggleNotificationCenter,
     /// Exit ChickenWM and restore explorer if desired.
     Exit,
 }
@@ -184,6 +187,7 @@ impl Action {
                 Some(arg.to_string())
             })),
             "settings" | "opensettings" => Some(Action::OpenSettings),
+            "notifications" | "notificationcenter" => Some(Action::ToggleNotificationCenter),
             "exit" => Some(Action::Exit),
             _ => None,
         }
@@ -279,6 +283,25 @@ pub enum IpcCommand {
     SetCompositorMode {
         dwm_hook_enabled: bool,
     },
+    /// Show a notification (`chickenwm-notify`, `\\.\pipe\chickenwm-notify-ipc`).
+    Notify(Notification),
+    /// Dismiss every notification currently on screen.
+    DismissNotifications,
+    /// Show / hide the notification center (history of past notifications).
+    ToggleNotificationCenter,
+}
+
+/// A desktop notification shown by `chickenwm-notify`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Notification {
+    /// Sending app ("Discord", "Steam", "chickenctl").
+    pub app: String,
+    pub title: String,
+    pub body: String,
+    /// Seconds on screen; `None` = the configured default, `Some(0)` = until dismissed.
+    pub timeout_secs: Option<u32>,
+    /// `low` | `normal` | `critical` (critical ones stay until dismissed).
+    pub urgency: Option<String>,
 }
 
 /// Representation of a managed Win32 window client.

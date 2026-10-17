@@ -1,16 +1,14 @@
-//! Theme section of the Appearance tab: accent color, light/dark mode, icon theme, a live
-//! palette + icon preview, and "Apply to whole system". Also turns `settings.css` into egui
-//! visuals so the settings window itself follows the theme.
+//! Appearance page: the theme gallery (ChickenWM + popular presets), light/dark, accent, icon
+//! theme and per-app modes. Changes apply to the whole system right away, except the accent,
+//! which applies when you press Apply (so dragging the color picker doesn't rewrite every
+//! stylesheet on each frame).
 
-use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
-use chickenwm_core::config::{RgbaColor};
-use chickenwm_core::css::CssStyleSheet;
+use crate::kit::{self, c32, Kit};
+use chickenwm_core::config::RgbaColor;
 use chickenwm_core::icon_theme::{available_themes, icons_root, IconTheme, CATEGORIES, SPECIAL_FOLDERS};
-use chickenwm_core::theme::{css, luminance, Palette, ThemeConfig, ThemeMode, DEFAULT_ACCENT};
-
-pub fn c32(c: RgbaColor) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
-}
+use chickenwm_core::theme::{css, AppMode, Palette, ThemeConfig, ThemeMode, DEFAULT_ACCENT};
+use chickenwm_core::theme_presets::PRESETS;
+use eframe::egui::{self, CornerRadius, FontId, Rect, Sense, Stroke, Vec2};
 
 pub struct ThemeEditor {
     pub draft: ThemeConfig,
@@ -22,12 +20,7 @@ pub struct ThemeEditor {
 
 impl ThemeEditor {
     pub fn new(current: &ThemeConfig) -> Self {
-        Self {
-            hex: css(current.accent),
-            draft: current.clone(),
-            icon_themes: available_themes(),
-            icons: None,
-        }
+        Self { hex: css(current.accent), draft: current.clone(), icon_themes: available_themes(), icons: None }
     }
 
     pub fn invalidate_icons(&mut self) {
@@ -35,168 +28,172 @@ impl ThemeEditor {
         self.icon_themes = available_themes();
     }
 
-    /// Draws the section. Returns `true` when the user pressed Apply.
-    pub fn ui(&mut self, ui: &mut egui::Ui, applied: &ThemeConfig) -> bool {
+    /// Draws the theme groups. Returns `true` when the draft should be applied now.
+    pub fn ui(&mut self, ui: &mut egui::Ui, kit: &Kit, applied: &ThemeConfig) -> bool {
         let mut apply = false;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(RichText::new("System Theme").strong().size(15.0));
-            ui.label(
-                RichText::new(
-                    "One accent color themes the bar, launcher, file explorer, browser, settings, window borders and icons.",
-                )
-                .small(),
-            );
-            ui.add_space(6.0);
+        // Keep the draft in step with changes made elsewhere (per-app modes, other apps).
+        if self.draft.app_modes != applied.app_modes {
+            self.draft.app_modes = applied.app_modes.clone();
+        }
 
-            ui.horizontal(|ui| {
-                ui.label("Accent:");
-                let mut rgb = [self.draft.accent.r, self.draft.accent.g, self.draft.accent.b];
-                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                    self.draft.accent = RgbaColor { r: rgb[0], g: rgb[1], b: rgb[2], a: 255 };
-                    self.hex = css(self.draft.accent);
-                }
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.hex).desired_width(80.0).font(egui::TextStyle::Monospace));
-                if resp.changed() {
-                    if let Some(c) = RgbaColor::parse(self.hex.trim()) {
-                        self.draft.accent = RgbaColor { a: 255, ..c };
+        kit::group(ui, kit, "Theme", |g| {
+            g.custom(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(12.0, 12.0);
+                    let mode = self.draft.mode;
+                    let generated = Palette::new(self.draft.accent, mode);
+                    if theme_tile(ui, kit, "ChickenWM", &generated, self.draft.preset.is_empty()) {
+                        self.draft.preset.clear();
+                        apply = true;
                     }
+                    for p in &PRESETS {
+                        let name = match mode {
+                            ThemeMode::Light => p.light_name,
+                            ThemeMode::Dark => p.dark_name,
+                        };
+                        let label = if name == p.name { p.name.to_string() } else { format!("{} · {name}", p.name) };
+                        if theme_tile(ui, kit, &label, &p.palette(mode), self.draft.preset == p.id) {
+                            self.draft.preset = p.id.to_string();
+                            apply = true;
+                        }
+                    }
+                });
+            });
+            g.row("Appearance", "Light or dark for every app that follows the system.", |ui| {
+                if kit::segmented(ui, kit, &mut self.draft.mode, &[(ThemeMode::Light, "☀ Light"), (ThemeMode::Dark, "🌙 Dark")]) {
+                    apply = true;
                 }
-                if ui.small_button("Reset").on_hover_text("#242321").clicked() {
-                    self.draft.accent = DEFAULT_ACCENT;
-                    self.hex = css(DEFAULT_ACCENT);
-                }
-                ui.separator();
-                ui.label("Mode:");
-                ui.selectable_value(&mut self.draft.mode, ThemeMode::Light, "☀ Light");
-                ui.selectable_value(&mut self.draft.mode, ThemeMode::Dark, "🌙 Dark");
-                ui.separator();
-                ui.label("Icons:");
+            });
+            if self.draft.preset.is_empty() {
+                g.row("Accent color", "The ChickenWM theme is generated from this one color.", |ui| {
+                    let dirty = self.draft.accent != applied.accent;
+                    if dirty && kit::button(ui, kit, "Apply", true).clicked() {
+                        apply = true;
+                    }
+                    if ui.small_button("Reset").on_hover_text("#242321").clicked() {
+                        self.draft.accent = DEFAULT_ACCENT;
+                        self.hex = css(DEFAULT_ACCENT);
+                    }
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.hex).desired_width(72.0).font(egui::TextStyle::Monospace));
+                    if resp.changed() {
+                        if let Some(c) = RgbaColor::parse(self.hex.trim()) {
+                            self.draft.accent = RgbaColor { a: 255, ..c };
+                        }
+                    }
+                    let mut rgb = [self.draft.accent.r, self.draft.accent.g, self.draft.accent.b];
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        self.draft.accent = RgbaColor { r: rgb[0], g: rgb[1], b: rgb[2], a: 255 };
+                        self.hex = css(self.draft.accent);
+                    }
+                });
+            }
+            g.row("Icons", "Icons in the file explorer and launcher.", |ui| {
+                let before = self.draft.icon_theme.clone();
                 egui::ComboBox::from_id_salt("icon_theme")
-                    .selected_text(&self.draft.icon_theme)
+                    .selected_text(icon_theme_label(&self.draft.icon_theme))
+                    .width(190.0)
                     .show_ui(ui, |ui| {
                         for t in self.icon_themes.clone() {
-                            let label = match t.as_str() {
-                                "system" => "system (Windows icons)".to_string(),
-                                "chickenwm" => "chickenwm (built-in, follows accent)".to_string(),
-                                _ => t.clone(),
-                            };
+                            let label = icon_theme_label(&t);
                             ui.selectable_value(&mut self.draft.icon_theme, t, label);
                         }
                     });
-            });
-
-            ui.add_space(8.0);
-            let palette = Palette::new(self.draft.accent, self.draft.mode);
-            self.preview(ui, &palette);
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let dirty = &self.draft != applied;
-                let btn = egui::Button::new(RichText::new("Apply to whole system").strong());
-                if ui.add_enabled(dirty, btn).clicked() {
+                if self.draft.icon_theme != before {
                     apply = true;
                 }
-                if dirty {
-                    ui.label(RichText::new("Preview — not applied yet").small().italics());
-                    if ui.small_button("Revert").clicked() {
-                        self.draft = applied.clone();
-                        self.hex = css(applied.accent);
-                    }
-                } else {
-                    ui.label(RichText::new("✔ Active").small());
-                }
             });
-            ui.label(
-                RichText::new(format!(
-                    "Writes the colors into launcher.css, files.css, settings.css, roobar.css and browser.css (other customizations are kept), sets the window border, and redraws the built-in icons in {}.",
-                    icons_root().join("chickenwm").display()
-                ))
-                .small(),
-            );
+            // Icon preview (the built-in set is redrawn from the palette on apply).
+            let theme_name = self.draft.icon_theme.clone();
+            if self.icons.as_ref().map(|(n, _)| n != &theme_name).unwrap_or(true) {
+                self.icons = Some((theme_name.clone(), load_icon_previews(g.ui.ctx(), &theme_name)));
+            }
+            if let Some((_, icons)) = &self.icons {
+                if !icons.is_empty() {
+                    g.custom(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, tex) in icons {
+                                ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(28.0))).on_hover_text(name);
+                            }
+                        });
+                    });
+                }
+            }
         });
         apply
     }
+}
 
-    fn preview(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // Mini window mock-up
-        egui::Frame::NONE
-            .fill(c32(p.base))
-            .stroke(Stroke::new(2.0_f32, c32(p.accent)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    egui::Frame::NONE.fill(c32(p.mantle)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Sidebar").color(c32(p.subtext)).small());
-                            ui.label(RichText::new("Downloads").color(c32(p.fg)));
-                            egui::Frame::NONE.fill(c32(p.selected)).corner_radius(CornerRadius::same(4)).inner_margin(egui::Margin::symmetric(4, 1)).show(ui, |ui| {
-                                ui.label(RichText::new("Documents").color(c32(p.fg)));
-                            });
-                        });
-                    });
-                    egui::Frame::NONE.fill(c32(p.surface)).corner_radius(CornerRadius::same(6)).stroke(Stroke::new(1.0_f32, c32(p.border))).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Projects").color(c32(p.dir)));
-                            ui.label(RichText::new("setup.exe").color(c32(p.exec)));
-                            ui.label(RichText::new("backup.zip").color(c32(p.archive)));
-                            ui.label(RichText::new("song.flac").color(c32(p.media)));
-                        });
-                    });
-                    ui.vertical(|ui| {
-                        egui::Frame::NONE.fill(c32(p.accent)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
-                            ui.label(RichText::new("Active workspace").color(c32(p.accent_fg)));
-                        });
-                        ui.label(RichText::new("Body text").color(c32(p.fg)));
-                        ui.label(RichText::new("Secondary text").color(c32(p.subtext)));
-                        ui.label(RichText::new("Danger").color(c32(p.danger)));
-                    });
-                });
-            });
-
-        // Swatches
-        ui.horizontal_wrapped(|ui| {
-            for (name, col) in [
-                ("base", p.base),
-                ("surface", p.surface),
-                ("mantle", p.mantle),
-                ("text", p.fg),
-                ("subtext", p.subtext),
-                ("accent", p.accent),
-                ("on accent", p.accent_fg),
-                ("accent soft", p.accent_soft),
-                ("folders", p.dir),
-                ("apps", p.exec),
-                ("archives", p.archive),
-                ("media", p.media),
-                ("code", p.code),
-            ] {
-                ui.vertical(|ui| {
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, 26.0), egui::Sense::click());
-                    ui.painter().rect(rect, CornerRadius::same(5), c32(col), Stroke::new(1.0_f32, c32(p.border)), egui::StrokeKind::Inside);
-                    resp.on_hover_text(format!("{name}: {}", css(col)));
-                    ui.label(RichText::new(name).small());
-                });
-            }
-        });
-
-        // Icons (built-in set reflects the applied palette; it's redrawn on Apply)
-        let theme_name = self.draft.icon_theme.clone();
-        if self.icons.as_ref().map(|(n, _)| n != &theme_name).unwrap_or(true) {
-            self.icons = Some((theme_name.clone(), load_icon_previews(ui.ctx(), &theme_name)));
-        }
-        if let Some((_, icons)) = &self.icons {
-            if icons.is_empty() {
-                ui.label(RichText::new("Windows shell icons (no icon theme)").small());
-            } else {
-                ui.horizontal_wrapped(|ui| {
-                    for (name, tex) in icons {
-                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(32.0, 32.0))).on_hover_text(name);
-                    }
-                });
-            }
-        }
+fn icon_theme_label(t: &str) -> String {
+    match t {
+        "system" => "Windows icons".to_string(),
+        "chickenwm" => "ChickenWM (follows theme)".to_string(),
+        _ => t.to_string(),
     }
+}
+
+/// One gallery tile: a tiny window mock-up in the theme's colors. Returns `true` when clicked.
+fn theme_tile(ui: &mut egui::Ui, kit: &Kit, name: &str, p: &Palette, selected: bool) -> bool {
+    let size = Vec2::new(132.0, 106.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let preview = Rect::from_min_size(rect.min, Vec2::new(size.x, 78.0));
+    let t = ui.ctx().animate_bool_with_time(resp.id, selected || resp.hovered(), 0.12);
+    // Selection ring.
+    if selected {
+        painter.rect_stroke(preview.expand(3.0), CornerRadius::same(11), Stroke::new(2.5_f32, kit.accent), egui::StrokeKind::Inside);
+    } else if t > 0.0 {
+        painter.rect_stroke(preview.expand(3.0), CornerRadius::same(11), Stroke::new(2.0_f32, kit.border.gamma_multiply(t * 2.0)), egui::StrokeKind::Inside);
+    }
+    let win = preview.shrink(if selected { 4.0 } else { 1.0 });
+    painter.rect(win, CornerRadius::same(8), c32(p.base), Stroke::new(1.0_f32, kit.border), egui::StrokeKind::Inside);
+    // Sidebar strip with a selected item.
+    let side = Rect::from_min_max(win.min, egui::pos2(win.left() + win.width() * 0.3, win.bottom()));
+    painter.rect_filled(side, CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, c32(p.mantle));
+    for i in 0..3 {
+        let y = side.top() + 12.0 + i as f32 * 12.0;
+        let line = Rect::from_min_size(egui::pos2(side.left() + 6.0, y), Vec2::new(side.width() - 12.0, 6.0));
+        let fill = if i == 1 { c32(p.accent) } else { c32(p.fg).gamma_multiply(0.25) };
+        painter.rect_filled(line, CornerRadius::same(3), fill);
+    }
+    // Content card.
+    let card = Rect::from_min_max(egui::pos2(side.right() + 7.0, win.top() + 8.0), egui::pos2(win.right() - 7.0, win.bottom() - 8.0));
+    painter.rect(card, CornerRadius::same(5), c32(p.surface), Stroke::new(1.0_f32, c32(p.border)), egui::StrokeKind::Inside);
+    let text = Rect::from_min_size(card.min + Vec2::new(6.0, 7.0), Vec2::new(card.width() * 0.6, 5.0));
+    painter.rect_filled(text, CornerRadius::same(3), c32(p.fg).gamma_multiply(0.85));
+    painter.rect_filled(text.translate(Vec2::new(0.0, 9.0)).scale_from_center2(Vec2::new(0.75, 1.0)), CornerRadius::same(3), c32(p.subtext).gamma_multiply(0.7));
+    // Highlight dots.
+    for (i, c) in [p.dir, p.exec, p.archive, p.media, p.danger].into_iter().enumerate() {
+        painter.circle_filled(egui::pos2(card.left() + 9.0 + i as f32 * 11.0, card.bottom() - 9.0), 3.5, c32(c));
+    }
+    // Accent button.
+    let btn = Rect::from_min_size(egui::pos2(card.right() - 26.0, card.bottom() - 15.0), Vec2::new(20.0, 10.0));
+    painter.rect_filled(btn, CornerRadius::same(5), c32(p.accent));
+    painter.text(
+        egui::pos2(rect.center().x, preview.bottom() + 15.0),
+        egui::Align2::CENTER_CENTER,
+        name,
+        FontId::proportional(12.0),
+        if selected { kit.fg } else { kit.sub },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Per-app light/dark rows. Returns the app whose choice the user changed.
+pub fn per_app_ui(ui: &mut egui::Ui, kit: &Kit, theme: &ThemeConfig) -> Option<(&'static str, AppMode)> {
+    use chickenwm_core::theme::app_mode_table;
+    let mut changed = None;
+    kit::group(ui, kit, "Per-app appearance", |g| {
+        for (id, name, choice, effective) in app_mode_table(theme) {
+            let hint = if choice == AppMode::System { format!("Follows the system ({})", effective.as_str()) } else { String::new() };
+            g.row(name, &hint, |ui| {
+                let mut sel = choice;
+                if kit::segmented(ui, kit, &mut sel, &[(AppMode::System, "Auto"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")]) {
+                    changed = Some((id, sel));
+                }
+            });
+        }
+    });
+    changed
 }
 
 fn load_icon_previews(ctx: &egui::Context, theme: &str) -> Vec<(String, egui::TextureHandle)> {
@@ -224,40 +221,29 @@ fn load_icon_previews(ctx: &egui::Context, theme: &str) -> Vec<(String, egui::Te
         .collect()
 }
 
-/// egui visuals from `settings.css` (light or dark depending on the background).
-pub fn apply_visuals(ctx: &egui::Context, sheet: &CssStyleSheet) {
-    let v = |n: &str, d: RgbaColor| sheet.var_color(n, d);
-    let bg = v("--bg-color", RgbaColor { r: 24, g: 24, b: 37, a: 255 });
-    let card = v("--card-bg", bg);
-    let side = v("--sidebar-bg", bg);
-    let fg = v("--fg-color", RgbaColor { r: 205, g: 214, b: 244, a: 255 });
-    let accent = v("--accent-color", RgbaColor { r: 51, g: 204, b: 255, a: 255 });
-    let accent_fg = v("--accent-fg", bg);
-    let selected = v("--selected-bg", RgbaColor { a: 50, ..accent });
-    let border = v("--border-color", RgbaColor { r: 49, g: 50, b: 68, a: 255 });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let light = luminance(bg) > 0.45;
-    let mut vis = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
-    vis.panel_fill = c32(side);
-    vis.window_fill = c32(card);
-    vis.extreme_bg_color = c32(card);
-    vis.faint_bg_color = c32(side);
-    vis.override_text_color = Some(c32(fg));
-    vis.hyperlink_color = c32(accent);
-    vis.selection.bg_fill = c32(selected).gamma_multiply(if light { 1.6 } else { 1.4 });
-    vis.selection.stroke = Stroke::new(1.0_f32, c32(accent));
-    vis.window_stroke = Stroke::new(1.0_f32, c32(border));
-    vis.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, c32(border));
-    vis.widgets.noninteractive.bg_fill = c32(card);
-    vis.widgets.inactive.bg_fill = c32(card);
-    vis.widgets.inactive.weak_bg_fill = c32(card);
-    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, c32(border));
-    vis.widgets.hovered.weak_bg_fill = c32(selected);
-    vis.widgets.hovered.bg_fill = c32(selected);
-    vis.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, c32(accent));
-    vis.widgets.active.weak_bg_fill = c32(accent);
-    vis.widgets.active.bg_fill = c32(accent);
-    vis.widgets.active.fg_stroke = Stroke::new(1.0_f32, c32(accent_fg));
-    vis.widgets.open.weak_bg_fill = c32(selected);
-    ctx.set_visuals(vis);
+    /// Drawing the page without any input must never apply a theme.
+    #[test]
+    fn idle_frames_do_not_apply() {
+        let ctx = egui::Context::default();
+        let applied = ThemeConfig { app_modes: vec![("files".into(), AppMode::Dark)], ..ThemeConfig::default() };
+        let mut editor = ThemeEditor::new(&applied);
+        let kit = Kit::from_css(&chickenwm_core::css::CssStyleSheet::default());
+        for frame in 0..8 {
+            let mut fired = false;
+            let mut per_app = None;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    fired = editor.ui(ui, &kit, &applied);
+                    per_app = per_app_ui(ui, &kit, &applied);
+                });
+            });
+            assert!(!fired, "theme applied on idle frame {frame}");
+            assert!(per_app.is_none(), "per-app mode changed on idle frame {frame}");
+        }
+        assert_eq!(editor.draft, applied);
+    }
 }

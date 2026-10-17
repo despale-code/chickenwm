@@ -294,12 +294,12 @@ pub const DEFAULT_LAUNCHER_CSS: &str = r#"/* ChickenWM Application Launcher Them
     --accent-secondary: #00ff99;
     --selected-bg: rgba(51, 204, 255, 0.18);
     --border-color: rgba(51, 204, 255, 0.85);
-    --border-radius: 12px;
+    --border-radius: 16px;
     --border-width: 2px;
     --font-family: "Segoe UI", "Inter", sans-serif;
     --font-size: 15px;
-    --row-height: 44px;
-    --icon-size: 28px;
+    --row-height: 48px;
+    --icon-size: 32px;
 }
 
 .launcher-window {
@@ -506,6 +506,36 @@ window#roobar {
 }
 "#;
 
+/// Default style for `chickenwm-notify` (`~/.config/chickenwm/notifications.css`). Colors are
+/// filled in from the system theme; sizes and motion are yours to change.
+pub const DEFAULT_NOTIFICATIONS_CSS: &str = r#"/* ChickenWM Notifications (~/.config/chickenwm/notifications.css)
+ * Position, timeout and count live in chickenwm.conf: notifications { position = top-right }.
+ * Hot-reloads on save.
+ */
+:root {
+    --card-bg: rgba(251, 251, 251, 0.97);
+    --fg-color: #242321;
+    --subtext-color: #625f59;
+    --accent-color: #242321;
+    --accent-fg: #f7f6f6;
+    --border-color: rgba(36, 35, 33, 0.16);
+    --shadow-color: rgba(20, 19, 18, 0.18);
+    --critical-color: #c0392b;
+
+    --card-width: 360px;
+    --border-radius: 12px;
+    --padding: 14px;
+    --gap: 10px;
+    --title-size: 15px;
+    --body-size: 13.5px;
+    --app-size: 11.5px;
+    --icon-size: 28px;
+    --font-family: "Segoe UI", sans-serif;
+    --anim-ms: 320;
+    --progress-height: 2px;
+}
+"#;
+
 /// Ensures all default CSS files (`launcher.css`, `files.css`, `settings.css`, `roobar.css`) exist in `~/.config/chickenwm/`.
 pub fn ensure_default_css_files() -> Result<()> {
     let dir = config_dir();
@@ -516,6 +546,7 @@ pub fn ensure_default_css_files() -> Result<()> {
         ("files.css", DEFAULT_FILES_CSS),
         ("settings.css", DEFAULT_SETTINGS_CSS),
         ("roobar.css", DEFAULT_ROOBAR_CSS),
+        ("notifications.css", DEFAULT_NOTIFICATIONS_CSS),
     ];
 
     for (name, content) in files {
@@ -603,10 +634,10 @@ mod tests {
     #[test]
     fn test_css_parser_and_var_resolution() {
         let sheet = CssStyleSheet::parse(DEFAULT_LAUNCHER_CSS);
-        assert_eq!(sheet.var_px("--border-radius", 0.0), 12.0);
-        assert_eq!(sheet.var_px("--row-height", 0.0), 44.0);
+        assert_eq!(sheet.var_px("--border-radius", 0.0), 16.0);
+        assert_eq!(sheet.var_px("--row-height", 0.0), 48.0);
         let win_style = sheet.rules.get(".launcher-window").expect("launcher-window rule");
-        assert_eq!(win_style.border_radius, Some(12.0));
+        assert_eq!(win_style.border_radius, Some(16.0));
         assert_eq!(win_style.backdrop_blur, Some(16.0));
         assert_eq!(win_style.transition_ms, Some(120.0));
     }

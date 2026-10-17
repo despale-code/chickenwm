@@ -1014,6 +1014,176 @@ pub struct HyprConfig {
     pub wallpapers: Vec<WallpaperDirective>,
     #[serde(default)]
     pub theme: crate::theme::ThemeConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub paper: PaperConfig,
+}
+
+/// The `paper { }` block: wallpaper layers composited bottom to top by `chickenwm-paper`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaperConfig {
+    pub layers: Vec<PaperLayer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaperLayerKind {
+    /// A picture file (PNG transparency is kept).
+    Image,
+    /// The theme's generated wallpaper.
+    Generated,
+    /// A solid color.
+    Color,
+    /// The animated shader background (`.wgsl` files are validated; the built-in aurora draws).
+    Shader,
+}
+
+/// One `layer = kind, source, key = value, …` line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaperLayer {
+    pub kind: PaperLayerKind,
+    /// Image / shader path, or the color for `color` layers. Empty for `generated`.
+    pub source: String,
+    /// 0..1
+    pub opacity: f32,
+    /// `normal` | `multiply` | `screen` | `add` | `overlay`
+    pub blend: String,
+    /// `cover` | `contain` | `stretch` | `center` | `tile`
+    pub fit: String,
+    /// Extra size factor for `center` and `tile`.
+    pub scale: f32,
+    /// Where a smaller-than-screen layer sits: 0 = left/top, 0.5 = middle, 1 = right/bottom.
+    pub align_x: f32,
+    pub align_y: f32,
+    /// Chroma key: pixels close to this color turn transparent.
+    pub key: Option<RgbaColor>,
+    /// How far (0..1, in chroma) from the key color pixels are fully removed.
+    pub tolerance: f32,
+    /// Width of the soft edge after `tolerance` (0..1).
+    pub softness: f32,
+    /// Removes the key color's tint from the edges that remain (green fringes).
+    pub despill: bool,
+}
+
+impl Default for PaperLayer {
+    fn default() -> Self {
+        Self {
+            kind: PaperLayerKind::Image,
+            source: String::new(),
+            opacity: 1.0,
+            blend: "normal".into(),
+            fit: "cover".into(),
+            scale: 1.0,
+            align_x: 0.5,
+            align_y: 0.5,
+            key: None,
+            tolerance: 0.2,
+            softness: 0.1,
+            despill: true,
+        }
+    }
+}
+
+/// Splits on commas that aren't inside parentheses, so `rgba(0, 255, 0, 1)` stays whole.
+fn split_top_level(v: &str) -> Vec<String> {
+    let (mut parts, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+    for ch in v.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth <= 0 => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur.trim().to_string());
+    }
+    parts
+}
+
+impl PaperLayer {
+    /// Parses the value of a `layer =` line: `image, ~/bg/char.png, key = rgb(00ff00), opacity = 0.8`.
+    pub fn parse(v: &str) -> Option<Self> {
+        let parts = split_top_level(v);
+        let mut it = parts.iter();
+        let kind = match it.next()?.to_ascii_lowercase().as_str() {
+            "image" | "img" => PaperLayerKind::Image,
+            "generated" | "theme" => PaperLayerKind::Generated,
+            "color" | "colour" | "solid" => PaperLayerKind::Color,
+            "shader" | "wgsl" => PaperLayerKind::Shader,
+            _ => return None,
+        };
+        let mut layer = Self { kind, ..Self::default() };
+        for part in it {
+            let Some((k, val)) = part.split_once('=') else {
+                if layer.source.is_empty() {
+                    layer.source = part.clone();
+                }
+                continue;
+            };
+            let (k, val) = (k.trim().to_ascii_lowercase(), val.trim());
+            let num = || val.parse::<f32>().ok();
+            match k.as_str() {
+                "opacity" | "alpha" => layer.opacity = num().unwrap_or(1.0).clamp(0.0, 1.0),
+                "blend" => layer.blend = val.to_ascii_lowercase(),
+                "fit" => layer.fit = val.to_ascii_lowercase(),
+                "scale" => layer.scale = num().unwrap_or(1.0).clamp(0.01, 50.0),
+                "x" | "align_x" => layer.align_x = num().unwrap_or(0.5).clamp(0.0, 1.0),
+                "y" | "align_y" => layer.align_y = num().unwrap_or(0.5).clamp(0.0, 1.0),
+                "key" | "chroma_key" | "chromakey" => layer.key = RgbaColor::parse(val),
+                "tolerance" | "similarity" => layer.tolerance = num().unwrap_or(0.2).clamp(0.0, 1.0),
+                "softness" | "smoothness" | "feather" => layer.softness = num().unwrap_or(0.1).clamp(0.0, 1.0),
+                "despill" | "spill" => layer.despill = parse_bool(val).unwrap_or(true),
+                "source" | "path" | "file" => layer.source = val.to_string(),
+                _ => {}
+            }
+        }
+        if matches!(kind, PaperLayerKind::Image | PaperLayerKind::Color) && layer.source.is_empty() {
+            return None;
+        }
+        Some(layer)
+    }
+}
+
+/// The `notifications { }` block (`chickenwm-notify`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    /// `top-right` | `top-left` | `bottom-right` | `bottom-left` | `top-center` | `bottom-center`
+    pub position: String,
+    /// Default seconds on screen (0 = until dismissed).
+    pub timeout: u32,
+    pub max_visible: u32,
+    /// Distance from the screen edges (px). Top/bottom margins are measured from the work
+    /// area, so notifications sit below roobar.
+    pub margin_x: i32,
+    pub margin_y: i32,
+    /// Show Windows app notifications (toasts) while Explorer isn't running.
+    pub windows_toasts: bool,
+    /// Apps (display names, case-insensitive) whose notifications are dropped.
+    pub blocked: Vec<String>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: "top-right".into(),
+            timeout: 6,
+            max_visible: 4,
+            margin_x: 16,
+            margin_y: 12,
+            windows_toasts: true,
+            blocked: Vec::new(),
+        }
+    }
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -1211,6 +1381,54 @@ impl HyprConfig {
                 }
                 _ => {}
             },
+            "paper" => {
+                if k == "layer" {
+                    if let Some(layer) = PaperLayer::parse(v) {
+                        self.paper.layers.push(layer);
+                    }
+                }
+            }
+            "notifications" => match k.as_str() {
+                "enabled" => {
+                    if let Some(b) = parse_bool(v) {
+                        self.notifications.enabled = b;
+                    }
+                }
+                "position" => self.notifications.position = v.to_ascii_lowercase(),
+                "timeout" => {
+                    if let Ok(n) = v.parse() {
+                        self.notifications.timeout = n;
+                    }
+                }
+                "max_visible" => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        self.notifications.max_visible = n.clamp(1, 12);
+                    }
+                }
+                "margin_x" => {
+                    if let Ok(n) = v.parse() {
+                        self.notifications.margin_x = n;
+                    }
+                }
+                "margin_y" => {
+                    if let Ok(n) = v.parse() {
+                        self.notifications.margin_y = n;
+                    }
+                }
+                "windows_toasts" => {
+                    if let Some(b) = parse_bool(v) {
+                        self.notifications.windows_toasts = b;
+                    }
+                }
+                "blocked" => {
+                    self.notifications.blocked = v
+                        .split(',')
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty())
+                        .collect();
+                }
+                _ => {}
+            },
             "theme" => match k.as_str() {
                 "accent" | "accent_color" => {
                     if let Some(c) = RgbaColor::parse(v) {
@@ -1223,6 +1441,15 @@ impl HyprConfig {
                     }
                 }
                 "icon_theme" | "icons" => self.theme.icon_theme = v.to_string(),
+                "preset" | "scheme" | "colorscheme" => {
+                    let v = v.trim();
+                    self.theme.preset = if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("chickenwm") {
+                        String::new()
+                    } else {
+                        crate::theme_presets::find(v).map_or_else(|| v.to_ascii_lowercase(), |p| p.id.to_string())
+                    };
+                }
+                "app_modes" => self.theme.app_modes = crate::theme::ThemeConfig::parse_app_modes(v),
                 _ => {}
             },
             "misc" => match k.as_str() {
@@ -1474,6 +1701,13 @@ theme {
     icon_theme = chickenwm
 }
 
+# Notifications (chickenwm-notify). Styling: ~/.config/chickenwm/notifications.css
+notifications {
+    position = top-right
+    timeout = 6
+    max_visible = 4
+}
+
 decoration {
     rounding = 10
     active_opacity = 1.0
@@ -1545,8 +1779,6 @@ input {
 }
 
 # Window rules (Hyprland windowrulev2 syntax)
-windowrulev2 = float, class:^(Taskmgr)$
-windowrulev2 = float, class:^(CalcFrame)$
 windowrulev2 = float, title:^(Picture-in-Picture)$
 windowrulev2 = float, class:^(chickenwm-settings)$
 windowrulev2 = float, class:^(roobar)$
@@ -1558,6 +1790,7 @@ bind = $mainMod, E, exec, $files
 bind = $mainMod, D, launcher,
 bind = ALT, Space, launcher,
 bind = $mainMod, I, settings,
+bind = $mainMod, N, notifications,
 bind = $mainMod, V, togglefloating,
 bind = $mainMod, F, fullscreen, 0
 bind = $mainMod, P, pseudo,
@@ -1646,6 +1879,22 @@ pub fn save_config_document(doc: &ConfigDocument) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paper_layers_parse() {
+        let cfg = ConfigDocument::parse(
+            "paper {\n    layer = image, ~/bg/sky.png\n    layer = image, ~/bg/char.png, key = rgb(00ff00), tolerance = 0.25, softness = 0.1\n    layer = shader, ~/shaders/rain.wgsl, opacity = 0.4, blend = screen\n    layer = color, rgba(0, 0, 0, 0.3)\n    layer = bogus, x\n}\n",
+        )
+        .unwrap()
+        .compile();
+        let l = &cfg.paper.layers;
+        assert_eq!(l.len(), 4);
+        assert_eq!(l[1].key, Some(RgbaColor { r: 0, g: 255, b: 0, a: 255 }));
+        assert_eq!(l[1].tolerance, 0.25);
+        assert_eq!(l[2].kind, PaperLayerKind::Shader);
+        assert_eq!((l[2].opacity, l[2].blend.as_str()), (0.4, "screen"));
+        assert_eq!(l[3].source, "rgba(0, 0, 0, 0.3)");
+    }
 
     #[test]
     fn test_parse_and_lossless_roundtrip() {
