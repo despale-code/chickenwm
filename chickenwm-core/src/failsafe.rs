@@ -137,7 +137,7 @@ pub fn trigger_emergency_restore(terminate_self: bool) {
 /// killed by the failsafe before it could restore its windows.
 const HIDDEN_BY_CHICKENWM_PROP: &str = "ChickenWMHiddenByWorkspace";
 
-/// Tags `hwnd` as hidden by HyperWin, so [`restore_all_desktop_windows`] knows to bring it back.
+/// Tags `hwnd` as hidden by ChickenWM, so [`restore_all_desktop_windows`] knows to bring it back.
 pub fn mark_hidden_by_chickenwm(hwnd: u64) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::SetPropW;
@@ -151,7 +151,7 @@ pub fn mark_hidden_by_chickenwm(hwnd: u64) {
     }
 }
 
-/// Removes the tag set by [`mark_hidden_by_chickenwm`] once HyperWin shows the window again.
+/// Removes the tag set by [`mark_hidden_by_chickenwm`] once ChickenWM shows the window again.
 pub fn clear_hidden_by_chickenwm(hwnd: u64) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::RemovePropW;
@@ -210,7 +210,7 @@ pub fn unpark_window(hwnd: u64) {
     clear_hidden_by_chickenwm(hwnd);
 }
 
-/// Unhides and restores the windows HyperWin hid on inactive workspaces, e.g. after chickenwm-wm
+/// Unhides and restores the windows ChickenWM hid on inactive workspaces, e.g. after chickenwm-wm
 /// or chickenwm-rooster was shut down or killed. Only windows tagged by [`mark_hidden_by_chickenwm`]
 /// are touched — tray-hidden apps and hidden system helper windows stay hidden.
 pub fn restore_all_desktop_windows() -> usize {

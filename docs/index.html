@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChickenWM</title>
+<meta name="description" content="ChickenWM: a Hyprland-style tiling desktop for Windows. One command installs the window manager, bar, launcher, file explorer, Hen Browser and the rest.">
+<link rel="icon" href="icons/chickenwm.png">
+<style>
+  :root {
+    --bg: #f4f1ea;
+    --surface: #fbf9f4;
+    --ink: #242321;
+    --sub: #6b665e;
+    --line: rgba(36, 35, 33, 0.14);
+    --accent: #e8a33d;
+    --radius: 14px;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); font: 16px/1.55 var(--sans); }
+  a { color: inherit; text-underline-offset: 3px; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+
+  header { padding: 56px 0 36px; display: flex; gap: 22px; align-items: center; }
+  header img { width: 96px; height: 96px; flex: none; }
+  h1 { font-size: 44px; line-height: 1.05; letter-spacing: -0.02em; }
+  .tag { color: var(--sub); font-size: 18px; margin-top: 6px; }
+  nav { margin-left: auto; display: flex; gap: 16px; font-size: 15px; }
+  nav a { text-decoration: none; color: var(--sub); }
+  nav a:hover { color: var(--ink); }
+
+  .install {
+    background: var(--ink);
+    color: #f4f1ea;
+    border-radius: var(--radius);
+    padding: 26px 26px 22px;
+  }
+  .install h2 { font-size: 20px; margin-bottom: 4px; }
+  .install p { color: rgba(244, 241, 234, 0.72); font-size: 14.5px; }
+  .cmd {
+    margin: 16px 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    padding: 12px 12px 12px 16px;
+    font: 15px var(--mono);
+    overflow-x: auto;
+  }
+  .cmd code { flex: 1; white-space: nowrap; }
+  .cmd .prompt { color: var(--accent); user-select: none; }
+  button.copy {
+    flex: none;
+    border: 0;
+    border-radius: 7px;
+    padding: 7px 12px;
+    background: var(--accent);
+    color: var(--ink);
+    font: 600 13px var(--sans);
+    cursor: pointer;
+  }
+  button.copy:active { transform: scale(0.97); }
+  .install ul { margin: 6px 0 0 18px; color: rgba(244, 241, 234, 0.72); font-size: 14px; }
+  .install code.inline { font: 13px var(--mono); background: rgba(255, 255, 255, 0.08); padding: 1px 6px; border-radius: 5px; }
+
+  section { padding: 40px 0 8px; }
+  h2.sec { font-size: 24px; letter-spacing: -0.01em; margin-bottom: 6px; }
+  p.lead { color: var(--sub); margin-bottom: 18px; max-width: 70ch; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .card {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    text-decoration: none;
+    transition: border-color 150ms, transform 150ms;
+  }
+  .card:hover { border-color: rgba(36, 35, 33, 0.35); transform: translateY(-1px); }
+  .card img { width: 52px; height: 52px; flex: none; }
+  .card h3 { font-size: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .card p { color: var(--sub); font-size: 14px; margin-top: 2px; }
+  .badge { font: 600 11px var(--sans); padding: 2px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--sub); }
+  .badge.req { background: var(--ink); color: #f4f1ea; border-color: var(--ink); }
+  .badge.warn { background: #fbe3c4; border-color: #e8a33d; color: #7a4a0a; }
+
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .box { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; font-size: 15px; }
+  .box h3 { font-size: 16px; margin-bottom: 6px; }
+  .box p, .box li { color: var(--sub); }
+  .box ul { margin-left: 18px; }
+  .box code { font: 13px var(--mono); background: rgba(36, 35, 33, 0.06); padding: 1px 6px; border-radius: 5px; }
+
+  footer { padding: 40px 0 56px; color: var(--sub); font-size: 14px; }
+
+  @media (max-width: 640px) {
+    header { flex-wrap: wrap; padding-top: 32px; }
+    header img { width: 72px; height: 72px; }
+    h1 { font-size: 34px; }
+    nav { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img src="icons/chickenwm.png" alt="">
+    <div>
+      <h1>ChickenWM</h1>
+      <div class="tag">A Hyprland-style tiling desktop for Windows.</div>
+    </div>
+    <nav>
+      <a href="#programs">Programs</a>
+      <a href="#details">Details</a>
+      <a href="https://github.com/despale-code/chickenwm">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="install">
+    <h2>Install</h2>
+    <p>Paste this into PowerShell. It downloads each program's source, builds it on your machine and installs it for your user. No administrator rights needed.</p>
+    <div class="cmd">
+      <span class="prompt">PS&gt;</span>
+      <code id="cmd">irm https://despale-code.github.io/chickenwm/install.ps1 | iex</code>
+      <button class="copy" data-copy="cmd">Copy</button>
+    </div>
+    <ul>
+      <li>You pick which programs to install. The core is always included; Hen Browser, the file explorer and the others are optional.</li>
+      <li>Rust is installed for you if it's missing (the official rustup installer). Building takes a few minutes the first time.</li>
+      <li>Every program gets a Start Menu entry and an App Paths registration, so Windows Search, <code class="inline">Win + R</code> and the ChickenWM launcher can find it.</li>
+      <li>Run the same command again to update. Uninstall from Settings &rsaquo; Apps &rsaquo; ChickenWM.</li>
+    </ul>
+  </div>
+
+  <section id="programs">
+    <h2 class="sec">Programs</h2>
+    <p class="lead">Each program lives in its own repository. They talk to each other over a named pipe, and the daemon, rooster, starts and supervises them.</p>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <section id="details">
+    <h2 class="sec">Details</h2>
+    <div class="cols">
+      <div class="box">
+        <h3>Requirements</h3>
+        <ul>
+          <li>Windows 10 or 11, 64-bit</li>
+          <li>Hen Browser needs the WebView2 runtime (part of Windows 11)</li>
+          <li>About 2 GB free for the first build</li>
+        </ul>
+      </div>
+      <div class="box">
+        <h3>Choosing programs without the menu</h3>
+        <p>Set these before running the command:</p>
+        <ul>
+          <li><code>$env:CHICKENWM_COMPONENTS = "henbrowser,chickenwm-files"</code></li>
+          <li><code>$env:CHICKENWM_ALL = "1"</code> &mdash; every optional program</li>
+          <li><code>$env:CHICKENWM_YES = "1"</code> &mdash; no questions</li>
+          <li><code>$env:CHICKENWM_DIR = "D:\Apps\ChickenWM"</code></li>
+        </ul>
+      </div>
+      <div class="box">
+        <h3>If something goes wrong</h3>
+        <p><code>Ctrl + Alt + Shift + Esc</code> is the emergency restore: it puts Explorer back and stops ChickenWM. Uninstalling also restores Explorer first. Your settings stay in <code>%USERPROFILE%\.config\chickenwm</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    MIT licensed. ChickenWM is vibecoded: written with an AI assistant.
+    &middot; <a href="https://github.com/despale-code/chickenwm">Source and full documentation</a>
+  </footer>
+</div>
+
+<script>
+  const programs = [
+    ["chickenwm-rooster", "Rooster", "The daemon: starts and supervises everything, hosts the tray and the failsafe.", "req"],
+    ["chickenwm-wm", "Window manager", "Dwindle and master tiling, workspaces, gaps, rounded corners, animations, window rules.", "req"],
+    ["chickenwm-binds", "Keybindings", "Global hotkeys and mouse binds, chord chains and modal layers, with a cheat-sheet overlay.", "req"],
+    ["chickenwm-settings", "Settings", "Every option in one app, without wrecking the formatting of your config file.", "req"],
+    ["chickenctl", "chickenctl", "Command-line control, modeled on hyprctl: dispatch, query, theme, doctor.", "req"],
+    ["chickenwm-core", "Core", "The shared library: config, CSS and themes, IPC, monitors, frame pacing.", "lib"],
+    ["roobar", "roobar", "The status bar: workspaces, media, stats, tray and a pill for network, sound, clock and notifications.", ""],
+    ["chickenwm-launcher", "Launcher", "Fuzzy app launcher with a calculator, unit and currency conversion, clipboard history and emoji.", ""],
+    ["chickenwm-notify", "Notifications", "Toasts, a notification center, quiet hours and per-app rules.", ""],
+    ["chickenwm-paper", "Wallpapers", "Images or live WGSL shaders, with transitions and layered scenes.", ""],
+    ["chickenwm-files", "Files", "A file explorer with tabs, previews, dual panes and real context menus.", ""],
+    ["chickenwm-shot", "Screenshots", "Freeze the screen, then pick a region, a window or the whole monitor.", ""],
+    ["henbrowser", "Hen Browser", "A light browser on WebView2: sidebar tabs, private tabs, ad blocking and Chrome Web Store extensions.", ""],
+    ["chickenwm-dwm-hook", "DWM hook", "Experimental compositor injection. Can trip game anti-cheat; off unless you turn it on.", "warn"],
+  ];
+  const grid = document.getElementById("grid");
+  for (const [repo, name, text, kind] of programs) {
+    const a = document.createElement("a");
+    a.className = "card";
+    a.href = "https://github.com/despale-code/" + repo;
+    const badge = kind === "req" ? '<span class="badge req">Always installed</span>'
+      : kind === "lib" ? '<span class="badge">Library</span>'
+      : kind === "warn" ? '<span class="badge warn">Optional &middot; off by default</span>'
+      : '<span class="badge">Optional</span>';
+    a.innerHTML = `<img src="icons/${repo}.png" alt=""><div><h3></h3><p></p></div>`;
+    a.querySelector("h3").textContent = name + " ";
+    a.querySelector("h3").insertAdjacentHTML("beforeend", badge);
+    a.querySelector("p").textContent = text;
+    grid.appendChild(a);
+  }
+  document.querySelectorAll("button.copy").forEach((b) => {
+    b.onclick = async () => {
+      const text = document.getElementById(b.dataset.copy).textContent;
+      try { await navigator.clipboard.writeText(text); } catch (_) {}
+      b.textContent = "Copied";
+      setTimeout(() => (b.textContent = "Copy"), 1500);
+    };
+  });
+</script>
+</body>
+</html>

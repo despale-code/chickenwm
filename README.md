@@ -45,7 +45,7 @@ browser, wallpaper engine and settings app · one accent color themes all of it.
 
 ## What's in the box
 
-ChickenWM is a Cargo workspace of small programs that talk to each other over a named pipe
+ChickenWM is a set of small programs that talk to each other over a named pipe
 (`\\.\pipe\chickenwm-ipc`). The daemon, **rooster**, starts and supervises the core pieces.
 
 | Program | What it does |
@@ -77,6 +77,21 @@ ChickenWM is a Cargo workspace of small programs that talk to each other over a 
 
 ## Installation
 
+### One command
+
+```powershell
+irm https://despale-code.github.io/chickenwm/install.ps1 | iex
+```
+
+The installer (also on [the website](https://despale-code.github.io/chickenwm/)) lets you pick
+which programs to install; the core is always included, Hen Browser, the file explorer and the
+others are optional, and the DWM hook is off unless you tick it. It downloads each program's
+source from GitHub and builds it with Rust (installing Rust through rustup if needed; it uses the
+GNU toolchain, so no Visual Studio is required), then installs for your user only into
+`%LOCALAPPDATA%\Programs\ChickenWM`: Start Menu shortcuts, App Paths registrations (Win + R,
+Windows Search and the ChickenWM launcher find them), `chickenctl` on `PATH`, and an entry in
+Settings › Apps for uninstalling. Run it again to update or to change the selection.
+
 ### Prebuilt
 
 Download `chickenwm-<version>-windows-x64.zip` from
@@ -87,7 +102,7 @@ that folder.
 ### From source
 
 ```powershell
-git clone https://github.com/despale-code/chickenwm.git
+git clone --recursive https://github.com/despale-code/chickenwm.git
 cd chickenwm
 cargo build --release
 ```
@@ -461,21 +476,29 @@ cargo run -p chickenwm-files -- C:\some\folder
 cargo run -p chickenwm-rooster -- --no-children   # daemon only, start modules yourself
 ```
 
-| Folder | Crate |
-|---|---|
-| `chickenwm-core/` | Shared library: config parser and lossless writer, CSS engine, theme and icon engine, IPC, failsafe, monitors, frame scheduler |
-| `chickenwm-rooster/` | Daemon / supervisor |
-| `chickenwm-wm/` | Window manager |
-| `chickenwm-binds/` | Hotkeys |
-| `chickenwm-paper/` | Wallpaper |
-| `roobar/` | Status bar |
-| `chickenwm-launcher/` | Launcher |
-| `chickenwm-files/` | File explorer |
-| `chickenwm-shot/` | Screenshot tool |
-| `chickenwm-settings/` | Settings |
-| `henbrowser/` | Browser |
-| `chickenctl/` | CLI |
-| `chickenwm-dwm-hook/` | Experimental DWM injection |
+| Folder | Repository | What it is |
+|---|---|---|
+| `chickenwm-core/` | [chickenwm-core](https://github.com/despale-code/chickenwm-core) | Shared library: config parser and lossless writer, CSS engine, theme and icon engine, IPC, failsafe, monitors, frame scheduler |
+| `chickenwm-rooster/` | [chickenwm-rooster](https://github.com/despale-code/chickenwm-rooster) | Daemon / supervisor |
+| `chickenwm-wm/` | [chickenwm-wm](https://github.com/despale-code/chickenwm-wm) | Window manager |
+| `chickenwm-binds/` | [chickenwm-binds](https://github.com/despale-code/chickenwm-binds) | Hotkeys |
+| `chickenwm-paper/` | [chickenwm-paper](https://github.com/despale-code/chickenwm-paper) | Wallpaper |
+| `chickenwm-notify/` | [chickenwm-notify](https://github.com/despale-code/chickenwm-notify) | Notifications |
+| `roobar/` | [roobar](https://github.com/despale-code/roobar) | Status bar |
+| `chickenwm-launcher/` | [chickenwm-launcher](https://github.com/despale-code/chickenwm-launcher) | Launcher |
+| `chickenwm-files/` | [chickenwm-files](https://github.com/despale-code/chickenwm-files) | File explorer |
+| `chickenwm-shot/` | [chickenwm-shot](https://github.com/despale-code/chickenwm-shot) | Screenshot tool |
+| `chickenwm-settings/` | [chickenwm-settings](https://github.com/despale-code/chickenwm-settings) | Settings |
+| `henbrowser/` | [henbrowser](https://github.com/despale-code/henbrowser) | Hen Browser |
+| `chickenctl/` | [chickenctl](https://github.com/despale-code/chickenctl) | CLI |
+| `chickenwm-dwm-hook/` | [chickenwm-dwm-hook](https://github.com/despale-code/chickenwm-dwm-hook) | Experimental DWM injection |
+
+Each program lives in its own repository and is checked out here as a git submodule (clone with
+`--recursive`, or run `git submodule update --init` afterwards). The workspace in this repository
+builds them all together; it patches the members' GitHub dependencies on `chickenwm-core` and
+`chickenwm-dwm-hook` to the local folders, so a change to core is picked up straight away. Commit
+and push inside a program's folder to update its repository, then commit the new submodule
+pointer here. Icons for every program are in `pictures/icons/`.
 
 Logs go to stdout; run a module from a terminal to see them. Set `RUST_LOG=debug` for more detail.
 
