@@ -102,6 +102,10 @@ pub enum Action {
     OpenSettings,
     /// Show / hide the notification center (`chickenwm-notify`).
     ToggleNotificationCenter,
+    /// Enter or exit a modal keybind layer (`submap, resize` / `submap, reset`).
+    Submap(String),
+    /// Toggle the keybind cheat-sheet overlay (`cheatsheet` / `showbinds`).
+    ShowBindsCheatSheet,
     /// Exit ChickenWM and restore explorer if desired.
     Exit,
 }
@@ -188,6 +192,8 @@ impl Action {
             })),
             "settings" | "opensettings" => Some(Action::OpenSettings),
             "notifications" | "notificationcenter" => Some(Action::ToggleNotificationCenter),
+            "submap" => Some(Action::Submap(arg.to_string())),
+            "cheatsheet" | "showbinds" | "binds" => Some(Action::ShowBindsCheatSheet),
             "exit" => Some(Action::Exit),
             _ => None,
         }
@@ -292,6 +298,10 @@ pub enum IpcCommand {
     DismissNotifications,
     /// Show / hide the notification center (history of past notifications).
     ToggleNotificationCenter,
+    /// Unread notifications and do-not-disturb (`chickenwm-notify`), for the bar's bell.
+    QueryNotificationStatus,
+    /// The system tray icons rooster hosts (`Shell_TrayWnd`), for the bar.
+    QueryTray,
 }
 
 /// A desktop notification shown by `chickenwm-notify`.
@@ -368,6 +378,24 @@ pub enum IpcResponse {
     Monitors(Vec<MonitorInfo>),
     Status(DaemonStatus),
     BarState(BarStateSnapshot),
+    NotificationStatus { unread: u32, dnd: bool },
+    Tray(Vec<TrayIcon>),
+}
+
+/// One notification-area icon, as registered with `Shell_NotifyIcon`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TrayIcon {
+    /// The window that gets the icon's callback messages.
+    pub hwnd: u64,
+    pub uid: u32,
+    pub callback_message: u32,
+    /// `HICON` (a copy owned by rooster; icons are valid across processes in a session).
+    pub icon: u64,
+    pub tip: String,
+    /// `NOTIFYICON_VERSION_4` (4) changes how click messages are packed.
+    pub version: u32,
+    pub pid: u32,
+    pub hidden: bool,
 }
 
 /// Asynchronous Named Pipe Server listening on `pipe_name`.

@@ -1,6 +1,8 @@
 //! Phase 1.2: `chickenctl` CLI Control Utility for ChickenWM.
 //! Sends IPC commands over `\\.\pipe\chickenwm-ipc` and inspects window/monitor/daemon state.
 
+mod doctor;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use chickenwm_core::failsafe::trigger_emergency_restore;
@@ -49,6 +51,22 @@ enum Commands {
     Launcher,
     /// Query ChickenWM daemon, window manager, and module watchdog status.
     Status,
+    /// Check the setup (shell, admin task, modules, IPC, DWM hook, failsafe hotkey, logs) and
+    /// say what to fix. Pass `--fix` to repair safe issues automatically.
+    Doctor {
+        /// Automatically repair safe problems (broken shell path, duplicate modules, missing theme/config files, DWM hook injection).
+        #[arg(long)]
+        fix: bool,
+    },
+    /// List the system tray icons rooster hosts.
+    Tray,
+    /// Check chickenwm.conf for mistakes (unknown settings, bad values, unclosed sections) and
+    /// print them with line numbers.
+    CheckConfig,
+    /// Show each windowrulev2 rule, why it can never apply (if so), and which open windows it
+    /// matches. Matching is re-run here, so it reflects the current titles.
+    #[command(alias = "windowrules")]
+    WindowRules,
     /// Set wallpaper image or live `.wgsl` shader on `chickenwm-paper`.
     Wallpaper {
         /// Path to PNG/JPEG/WebP image or `.wgsl` shader file.
@@ -83,6 +101,26 @@ enum Commands {
         app: Option<String>,
         #[arg(long)]
         app_mode: Option<String>,
+        /// Save the current theme to a shareable file (`--export night.chickentheme`).
+        #[arg(long)]
+        export: Option<std::path::PathBuf>,
+        /// Load and apply a theme file.
+        #[arg(long)]
+        import: Option<std::path::PathBuf>,
+        /// Take the accent colour from the current wallpaper image.
+        #[arg(long)]
+        from_wallpaper: bool,
+        /// Switch light/dark by the clock: `off`, `times` (with --light-at / --dark-at) or `sun`
+        /// (sunset to sunrise at --location).
+        #[arg(long)]
+        auto_dark: Option<String>,
+        #[arg(long)]
+        light_at: Option<String>,
+        #[arg(long)]
+        dark_at: Option<String>,
+        /// `latitude,longitude` for `--auto-dark sun` (e.g. `41.01,28.97`).
+        #[arg(long, allow_hyphen_values = true)]
+        location: Option<String>,
     },
     /// Show a notification (`chickenctl notify "Backup done" "42 files copied" --app Robocopy`).
     Notify {
@@ -122,13 +160,87 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::CheckConfig => {
+            let issues = chickenwm_core::config_check::validate_user_config()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&issues)?);
+            } else if issues.is_empty() {
+                println!("ok: chickenwm.conf has no problems");
+            } else {
+                for i in &issues {
+                    let tag = if i.severity == chickenwm_core::config_check::Severity::Error { "error" } else { "warning" };
+                    println!("chickenwm.conf:{}: {tag}: {}", i.line, i.message);
+                }
+            }
+            let errors = issues.iter().any(|i| i.severity == chickenwm_core::config_check::Severity::Error);
+            std::process::exit(if errors { 1 } else { 0 });
+        }
+        Commands::WindowRules => {
+            use chickenwm_core::window_rules::{compile, WindowFacts};
+            let (_, cfg) = chickenwm_core::config::load_or_init_config()?;
+            let rules = compile(&cfg.window_rules);
+            // Without a running WM the rules are still checked; only the window matches are skipped.
+            let clients = match send_ipc_command(&IpcCommand::QueryClients).await {
+                Ok(IpcResponse::Clients(c)) => Some(c),
+                _ => None,
+            };
+            let offline = clients.is_none();
+            let clients = clients.unwrap_or_default();
+            if cli.json {
+                let rows: Vec<serde_json::Value> = rules
+                    .iter()
+                    .map(|r| {
+                        let hits: Vec<u64> = clients
+                            .iter()
+                            .filter(|c| r.matches(&WindowFacts { class: &c.class, title: &c.title, process: &c.process_name }))
+                            .map(|c| c.hwnd)
+                            .collect();
+                        serde_json::json!({ "effect": r.rule.effect, "matcher": r.rule.matcher, "problems": r.problems(), "windows": hits })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if rules.is_empty() {
+                println!("No window rules in chickenwm.conf.");
+            }
+            for r in &rules {
+                println!("{}, {}", r.rule.effect, r.rule.matcher);
+                for p in r.problems() {
+                    println!("    ! {p}");
+                }
+                let mut any = false;
+                for c in &clients {
+                    if r.matches(&WindowFacts { class: &c.class, title: &c.title, process: &c.process_name }) {
+                        println!("    -> 0x{:X} {} \"{}\" (ws {})", c.hwnd, c.process_name, c.title, c.workspace_id);
+                        any = true;
+                    }
+                }
+                if offline {
+                    println!("    (ChickenWM isn't running: open windows not checked)");
+                } else if !any {
+                    println!("    (no open window matches)");
+                }
+            }
+            return Ok(());
+        }
+        Commands::Doctor { fix } => {
+            let checks = doctor::run(fix);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&checks)?);
+            } else {
+                doctor::print(&checks);
+            }
+            let failed = checks.iter().any(|c| c.level == doctor::Level::Fail);
+            std::process::exit(if failed { 1 } else { 0 });
+        }
         Commands::RestoreExplorer => {
             let _ = send_ipc_command(&IpcCommand::RestoreExplorer).await;
             trigger_emergency_restore(false);
             println!("ok: explorer.exe restored as default shell and launched.");
             return Ok(());
         }
-        Commands::Theme { accent, mode, icons, preset, app, app_mode } => {
+        Commands::Theme { accent, mode, icons, preset, app, app_mode, export, import, from_wallpaper, auto_dark, light_at, dark_at, location } => {
             use chickenwm_core::theme;
             if let (Some(app), Some(m)) = (app, app_mode) {
                 let m = theme::AppMode::parse(&m).with_context(|| format!("app mode must be system, light or dark, not {m}"))?;
@@ -139,8 +251,56 @@ async fn main() -> Result<()> {
                 println!("ok: {app} → {} (uses {})", m.as_str(), t.mode_for(&app).as_str());
                 return Ok(());
             }
+            use chickenwm_core::theme_tools;
+            if let Some(path) = import {
+                let name = theme_tools::import_and_apply(&path)?;
+                println!("ok: theme \"{name}\" imported and applied");
+                return Ok(());
+            }
             let (mut doc, cfg) = chickenwm_core::bootstrap_config_and_themes()?;
+            if let Some(path) = export {
+                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "My theme".into());
+                std::fs::write(&path, theme_tools::export_theme(&cfg.theme, &name))?;
+                println!("ok: theme saved to {}", path.display());
+                return Ok(());
+            }
             let mut t = cfg.theme.clone();
+            if from_wallpaper {
+                let wp = cfg.wallpapers.first().context("no wallpaper image is set")?;
+                let path = chickenwm_core::config::expand_home(&wp.path);
+                t.accent = theme_tools::accent_from_image(&path).with_context(|| format!("couldn't find a colourful accent in {}", path.display()))?;
+                t.preset.clear();
+            }
+            let auto_changed = auto_dark.is_some() || light_at.is_some() || dark_at.is_some() || location.is_some();
+            if let Some(a) = auto_dark {
+                anyhow::ensure!(matches!(a.as_str(), "off" | "times" | "sun"), "--auto-dark must be off, times or sun");
+                t.auto_dark.mode = a;
+            }
+            if let Some(v) = light_at {
+                theme_tools::parse_hm(&v).with_context(|| format!("--light-at wants HH:MM, not {v}"))?;
+                t.auto_dark.light_at = v;
+            }
+            if let Some(v) = dark_at {
+                theme_tools::parse_hm(&v).with_context(|| format!("--dark-at wants HH:MM, not {v}"))?;
+                t.auto_dark.dark_at = v;
+            }
+            if let Some(loc) = location {
+                let mut it = loc.split(',').map(|s| s.trim().parse::<f64>());
+                match (it.next(), it.next()) {
+                    (Some(Ok(lat)), Some(Ok(lon))) => {
+                        t.auto_dark.latitude = Some(lat);
+                        t.auto_dark.longitude = Some(lon);
+                    }
+                    _ => anyhow::bail!("--location wants latitude,longitude"),
+                }
+            }
+            if auto_changed {
+                theme_tools::write_auto_dark_keys(&mut doc, &t.auto_dark);
+                let (y, m, d, minute, offset) = theme_tools::local_clock();
+                if let Some(want) = theme_tools::desired_mode(&t.auto_dark, y, m, d, minute, offset) {
+                    t.mode = want;
+                }
+            }
             if let Some(a) = &accent {
                 t.accent = chickenwm_core::config::RgbaColor::parse(a.trim())
                     .map(|c| chickenwm_core::config::RgbaColor { a: 255, ..c })
@@ -251,6 +411,7 @@ async fn main() -> Result<()> {
         Commands::Fps { fps } => IpcCommand::SetFramerate(if fps == 0 { None } else { Some(fps) }),
         Commands::Launcher => IpcCommand::SummonLauncher,
         Commands::Status => IpcCommand::QueryStatus,
+        Commands::Tray => IpcCommand::QueryTray,
         Commands::Wallpaper {
             path,
             monitor,
@@ -260,7 +421,7 @@ async fn main() -> Result<()> {
             path,
             transition: Some(transition),
         },
-        Commands::Monitors | Commands::RestoreExplorer | Commands::RestoreWindows | Commands::Theme { .. } | Commands::RenderWallpaper { .. } | Commands::Notify { .. } | Commands::Notifications => unreachable!(),
+        Commands::Monitors | Commands::RestoreExplorer | Commands::RestoreWindows | Commands::Theme { .. } | Commands::RenderWallpaper { .. } | Commands::Notify { .. } | Commands::Notifications | Commands::Doctor { .. } | Commands::CheckConfig | Commands::WindowRules => unreachable!(),
     };
 
     let response = send_ipc_command(&ipc_cmd).await?;
@@ -321,6 +482,17 @@ async fn main() -> Result<()> {
             println!("  Monitors Connected:  {}", st.monitor_count);
             println!("  Managed Windows:     {}", st.client_count);
             println!("  Active Modules:      {}", st.modules_running.join(", "));
+        }
+        IpcResponse::NotificationStatus { unread, dnd } => {
+            println!("{unread} unread notification(s){}", if dnd { ", do not disturb is on" } else { "" });
+        }
+        IpcResponse::Tray(icons) => {
+            if icons.is_empty() {
+                println!("No tray icons (rooster hosts the tray only while Explorer's taskbar isn't running).");
+            }
+            for i in icons {
+                println!("{:>6}  {}{}", i.pid, if i.tip.is_empty() { "(no tooltip)" } else { &i.tip }, if i.hidden { "  [hidden]" } else { "" });
+            }
         }
         IpcResponse::BarState(bs) => {
             println!(

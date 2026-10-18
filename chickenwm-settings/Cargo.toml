@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chickenwm-core = { workspace = true, features = ["egui"] }
+chickenwm-core = { workspace = true, features = ["egui", "headless"] }
 image.workspace = true
 tokio.workspace = true
 serde.workspace = true

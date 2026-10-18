@@ -6,6 +6,84 @@ use chickenwm_core::config::RgbaColor;
 use chickenwm_core::css::CssStyleSheet;
 use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Layout, Rect, Response, RichText, Sense, Stroke, Vec2};
 
+thread_local! {
+    /// While set, every `Group::row` records its (label, hint): how settings search learns
+    /// what each page contains (pages are drawn once, invisibly, to collect them).
+    static INDEX: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
+    /// The row a search result points at, and when it was picked.
+    static HIGHLIGHT: std::cell::RefCell<Option<(String, std::time::Instant)>> = const { std::cell::RefCell::new(None) };
+    /// Active `config_check::Issue` list so `Group::row` can display errors inline on the right control with line numbers.
+    static CONFIG_ISSUES: std::cell::RefCell<Vec<chickenwm_core::config_check::Issue>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `draw` and returns the rows it laid out.
+pub fn collect_rows(draw: impl FnOnce()) -> Vec<(String, String)> {
+    INDEX.with(|i| *i.borrow_mut() = Some(Vec::new()));
+    draw();
+    INDEX.with(|i| i.borrow_mut().take().unwrap_or_default())
+}
+
+/// Scrolls to and flashes the row + control labelled `label` the next time its page is drawn.
+pub fn highlight_row(label: &str) {
+    HIGHLIGHT.with(|h| *h.borrow_mut() = Some((label.to_owned(), std::time::Instant::now())));
+}
+
+/// Updates the `config_check` issues consulted by `Group::row` for inline control error badges.
+pub fn set_config_issues(issues: &[chickenwm_core::config_check::Issue]) {
+    CONFIG_ISSUES.with(|c| *c.borrow_mut() = issues.to_vec());
+}
+
+/// Maps a settings row label to its underlying `(category, key)` pair(s) in `chickenwm.conf`.
+pub fn row_keys_for_label(label: &str) -> &'static [(&'static str, &'static str)] {
+    match label {
+        "Use ChickenWM as the Windows shell" => &[("misc", "replace_winlogon_shell")],
+        "Hide Explorer's taskbar and desktop" => &[("misc", "suppress_explorer")],
+        "Run ChickenWM as administrator" => &[("misc", "run_as_admin")],
+        "Open folders in ChickenWM Files" => &[("misc", "register_files_handler")],
+        "Active border" => &[("general", "col.active_border")],
+        "Border rotation speed" => &[("decoration", "border_anim_speed")],
+        "Corner rounding" => &[("decoration", "rounding")],
+        "Focused window opacity" => &[("decoration", "active_opacity")],
+        "Other windows' opacity" => &[("decoration", "inactive_opacity")],
+        "Backdrop blur" => &[("decoration", "blur_enabled")],
+        "Match the display" | "Frame rate limit" => &[("misc", "fps_limit")],
+        "Save power when idle" => &[("misc", "vfr")],
+        "Engine" => &[("misc", "dwm_hook_enabled"), ("misc", "compositor_hook")],
+        "Layout" => &[("general", "layout")],
+        "Gaps between windows" => &[("general", "gaps_in")],
+        "Gaps at screen edges" => &[("general", "gaps_out")],
+        "Border width" => &[("general", "border_size")],
+        "Split ratio" => &[("dwindle", "default_split_ratio")],
+        "Keep split direction" => &[("dwindle", "preserve_split")],
+        "Master area size" => &[("master", "mfact")],
+        "No gaps for a single window" => &[("dwindle", "smart_gaps"), ("master", "smart_gaps")],
+        "Hide title bars" => &[("general", "no_titlebars")],
+        "Focus follows the mouse" => &[("input", "follow_mouse")],
+        "Hover delay" => &[("input", "hover_delay_ms")],
+        "Ignore the mouse after typing" => &[("input", "keyboard_grace_ms")],
+        "Switch automatically" => &[("theme:auto_dark", "mode")],
+        "Light from" => &[("theme:auto_dark", "light_at")],
+        "Dark from" => &[("theme:auto_dark", "dark_at")],
+        "Location" => &[("theme:auto_dark", "location")],
+        _ => &[],
+    }
+}
+
+/// Finds any `config_check::Issue` matching a setting row's label.
+pub fn inline_issues_for_row(label: &str) -> Vec<chickenwm_core::config_check::Issue> {
+    let pairs = row_keys_for_label(label);
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    CONFIG_ISSUES.with(|c| {
+        c.borrow()
+            .iter()
+            .filter(|issue| pairs.iter().any(|(cat, key)| issue.targets_setting(cat, key)))
+            .cloned()
+            .collect()
+    })
+}
+
 pub fn c32(c: RgbaColor) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
@@ -102,15 +180,49 @@ impl Group<'_> {
         self.rows += 1;
     }
 
-    /// A row: `label` (and an optional hint under it) on the left, `control` right-aligned.
+    /// A row: `label` (and an optional hint under it) on the left, `control` right-aligned,
+    /// plus inline config-check error badges with line numbers and search-jump control highlighting.
     pub fn row<R>(&mut self, label: &str, hint: &str, control: impl FnOnce(&mut egui::Ui) -> R) -> R {
         self.separator();
         let kit = self.kit;
-        let min_h = if hint.is_empty() { 40.0 } else { 52.0 };
+        let inline_issues = inline_issues_for_row(label);
+        let min_h = if !inline_issues.is_empty() {
+            62.0
+        } else if hint.is_empty() {
+            40.0
+        } else {
+            52.0
+        };
+        INDEX.with(|i| {
+            if let Some(rows) = i.borrow_mut().as_mut() {
+                rows.push((label.to_owned(), hint.to_owned()));
+            }
+        });
+        // A search result was picked: bring this row into view and flash both row and right-hand control.
+        let highlight_age = HIGHLIGHT.with(|h| {
+            h.borrow()
+                .as_ref()
+                .and_then(|(l, at)| (l == label).then(|| at.elapsed().as_secs_f32()))
+        });
+        if let Some(age) = highlight_age {
+            let rect = Rect::from_min_size(self.ui.cursor().min, Vec2::new(self.ui.available_width(), min_h));
+            if age < 0.25 {
+                self.ui.scroll_to_rect(rect, Some(Align::Center));
+            }
+            if age < 2.2 {
+                let a = (1.0 - age / 2.2).clamp(0.0, 1.0);
+                self.ui.painter().rect_filled(
+                    rect.expand2(Vec2::new(10.0, 0.0)),
+                    CornerRadius::same(6),
+                    kit.accent.gamma_multiply(0.22 * a),
+                );
+                self.ui.ctx().request_repaint();
+            }
+        }
         self.ui
             .allocate_ui_with_layout(Vec2::new(self.ui.available_width(), min_h), Layout::left_to_right(Align::Center), |ui| {
                 ui.set_min_height(min_h);
-                let text_w = (ui.available_width() * 0.55).max(160.0);
+                let text_w = (ui.available_width() * 0.50).max(150.0);
                 ui.allocate_ui_with_layout(Vec2::new(text_w, min_h), Layout::top_down(Align::Min), |ui| {
                     ui.add_space(if hint.is_empty() { (min_h - 18.0) / 2.0 } else { 9.0 });
                     ui.label(RichText::new(label).size(14.0).color(kit.fg));
@@ -118,7 +230,37 @@ impl Group<'_> {
                         ui.add(egui::Label::new(RichText::new(hint).size(12.0).color(kit.sub)).wrap());
                     }
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), control).inner
+                let ctrl_resp = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let out = control(ui);
+                    for issue in &inline_issues {
+                        let is_err = issue.severity == chickenwm_core::config_check::Severity::Error;
+                        let col = if is_err {
+                            kit.danger
+                        } else {
+                            Color32::from_rgb(235, 160, 40)
+                        };
+                        chip(
+                            ui,
+                            &kit,
+                            &format!("⚠ L{}: {}", issue.line, issue.message),
+                            col,
+                        );
+                    }
+                    out
+                });
+                if let Some(age) = highlight_age {
+                    if age < 2.2 {
+                        let a = (1.0 - age / 2.2).clamp(0.0, 1.0);
+                        let highlight_rect = ctrl_resp.response.rect.expand2(Vec2::new(4.0, 2.0));
+                        ui.painter().rect_stroke(
+                            highlight_rect,
+                            CornerRadius::same(7),
+                            Stroke::new(2.0_f32, kit.accent.gamma_multiply(a)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+                ctrl_resp.inner
             })
             .inner
     }

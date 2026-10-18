@@ -6,42 +6,37 @@
 //! `ConfigDocument` AST and applied live over IPC. The window follows the system theme
 //! (`settings.css`).
 //!
-//! Pages: General (shell, default file manager, startup apps, recovery), Appearance (theme
-//! gallery, light/dark, accent, icons, per-app modes, window looks, stylesheets), Wallpaper,
-//! Displays (monitors, frame rate, compositor), Tiling, Animations (bezier editor), Keyboard
-//! (shortcuts) and Window Rules (with a click-to-pick window inspector).
+//! Pages live under `src/pages/`: General, Appearance, Wallpaper, Displays, Tiling,
+//! Animations, Keyboard, Window Rules, Fonts, and Logs.
 
 // Release builds are windowed apps: no console window when launched from the shell, a
 // hotkey or the launcher. Debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod kit;
+mod pages;
 mod theme_ui;
 
 use anyhow::Result;
 use chickenwm_core::bootstrap_config_and_themes;
-use chickenwm_core::config::{
-    config_dir, save_config_document, BezierCurve, BindKind, BindRule, ConfigDocument, HyprConfig, PaperLayerKind,
-    RgbaColor, WindowRuleV2,
-};
+use chickenwm_core::config::{config_dir, save_config_document, ConfigDocument, HyprConfig};
 use chickenwm_core::css::{load_css_sheet, spawn_config_watcher, ConfigWatchEvent, CssStyleSheet};
 use chickenwm_core::failsafe::{
-    is_files_handler_registered, register_files_shell_handler, spawn_emergency_failsafe_thread, trigger_emergency_restore,
+    is_files_handler_registered, register_files_shell_handler, spawn_emergency_failsafe_thread,
 };
 use chickenwm_core::init_tracing;
-use chickenwm_core::ipc::{send_ipc_command_blocking, IpcCommand, MonitorInfo, PIPE_NAME_DAEMON, PIPE_NAME_PAPER, PIPE_NAME_WM};
-use chickenwm_core::monitor::{enumerate_monitors, max_native_refresh_rate};
+use chickenwm_core::ipc::{
+    send_ipc_command_blocking, IpcCommand, MonitorInfo, PIPE_NAME_DAEMON, PIPE_NAME_WM,
+};
+use chickenwm_core::monitor::enumerate_monitors;
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke, Vec2};
 use kit::Kit;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetCursorPos, GetWindowTextW, WindowFromPoint, GA_ROOT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub(crate) enum Page {
     General,
     Appearance,
     Wallpaper,
@@ -51,19 +46,20 @@ enum Page {
     Keyboard,
     WindowRules,
     Fonts,
+    Logs,
 }
 
-struct PageInfo {
-    page: Page,
-    glyph: &'static str,
-    tile: Color32,
-    title: &'static str,
-    subtitle: &'static str,
+pub(crate) struct PageInfo {
+    pub page: Page,
+    pub glyph: &'static str,
+    pub tile: Color32,
+    pub title: &'static str,
+    pub subtitle: &'static str,
     /// Extra words the sidebar search matches.
-    keywords: &'static str,
+    pub keywords: &'static str,
 }
 
-const PAGES: [PageInfo; 9] = [
+pub(crate) const PAGES: [PageInfo; 10] = [
     PageInfo {
         page: Page::General,
         glyph: "⚙",
@@ -126,125 +122,190 @@ const PAGES: [PageInfo; 9] = [
         tile: Color32::from_rgb(99, 99, 102),
         title: "Keyboard",
         subtitle: "Keyboard shortcuts.",
-        keywords: "keybinds binds shortcuts hotkeys keys",
+        keywords: "keybinds binds shortcuts hotkeys keys submap chain",
     },
     PageInfo {
         page: Page::WindowRules,
         glyph: "▣",
         tile: Color32::from_rgb(255, 59, 48),
         title: "Window Rules",
-        subtitle: "Per-app rules: float, workspace, opacity and more.",
-        keywords: "windowrule windowrulev2 float class inspector crosshair",
+        subtitle: "Per-app rules: float, workspace, opacity, process, initialTitle and more.",
+        keywords: "windowrule windowrulev2 float class process initialtitle inspector crosshair",
+    },
+    PageInfo {
+        page: Page::Logs,
+        glyph: "☰",
+        tile: Color32::from_rgb(120, 120, 128),
+        title: "Logs",
+        subtitle: "What each module wrote, and crashes.",
+        keywords: "log logs crash crashes error errors panic debug trace module",
     },
 ];
 
-fn info(page: Page) -> &'static PageInfo {
-    PAGES.iter().find(|p| p.page == page).expect("page info")
+pub(crate) fn info(page: Page) -> &'static PageInfo {
+    PAGES.iter().find(|p| p.page == page).unwrap_or(&PAGES[0])
 }
 
-struct SettingsApp {
-    page: Page,
-    search: String,
-    doc: ConfigDocument,
-    cfg: HyprConfig,
-    monitors: Vec<MonitorInfo>,
-    css: Arc<RwLock<CssStyleSheet>>,
-    /// Keeps the UI font in step with `--font-family` in settings.css.
-    font: chickenwm_core::fonts::EguiFont,
-    /// Installed font families (loaded when the Fonts page first shows, refreshed after installs).
-    installed_fonts: Option<Vec<String>>,
-    /// Each module's current font (first family of its `--font-family`), in `FONT_TARGETS`
-    /// order, and when it was read: re-read about once a second, not every frame.
-    current_fonts: Option<(Instant, Vec<String>)>,
-    font_filter: String,
-    /// A Nerd Font the user clicked, waiting for "Download?" confirmation.
-    font_confirm: Option<FontRequest>,
-    /// The download/install running in the background, if any.
-    font_job: Option<Arc<std::sync::Mutex<FontJob>>>,
-    status_banner: String,
-    /// The banner text last shown and when it changed (it's shown briefly as a toast).
-    status_seen: String,
-    status_at: Option<Instant>,
-
-    new_exec_once: String,
-
-    show_css_editor: bool,
-    selected_css_file: String,
-    css_editor_buffer: String,
-
-    selected_bezier_idx: usize,
-    bezier_preview_t: f32,
-    last_tick: Instant,
-
-    bind_search: String,
-    recording_keybind: bool,
-    recorded_mods: String,
-    recorded_key: String,
-    new_bind_dispatcher: String,
-    new_bind_arg: String,
-
-    inspecting_crosshair: bool,
-    inspected_class: String,
-    inspected_title: String,
-    new_rule_effect: String,
-
-    wallpaper_path_input: String,
-    wallpaper_transition: &'static str,
-
-    /// Default file manager registry state (cached; re-read after every change).
-    files_handler_active: bool,
-
-    theme_editor: theme_ui::ThemeEditor,
-    /// settings.css the current visuals were built from.
-    visuals_from: Option<CssStyleSheet>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoEntry {
+    pub label: String,
+    pub before: String,
+    pub diff: Vec<String>,
 }
 
-const TRANSITIONS: [&str; 4] = ["fade", "wipe", "outer", "grow"];
+/// Computes a concise `- old` / `+ new` line diff between two texts.
+pub fn compute_line_diff(before: &str, after: &str) -> Vec<String> {
+    let old_lines: Vec<&str> = before.lines().collect();
+    let new_lines: Vec<&str> = after.lines().collect();
+    let mut out = Vec::new();
+    let max_len = old_lines.len().max(new_lines.len());
+    for i in 0..max_len {
+        match (old_lines.get(i).copied(), new_lines.get(i).copied()) {
+            (Some(a), Some(b)) if a != b => {
+                out.push(format!("- L{}: {a}", i + 1));
+                out.push(format!("+ L{}: {b}", i + 1));
+            }
+            (Some(a), None) => out.push(format!("- L{}: {a}", i + 1)),
+            (None, Some(b)) => out.push(format!("+ L{}: {b}", i + 1)),
+            _ => {}
+        }
+    }
+    out
+}
 
-/// Where a picked font goes: one module's stylesheet, all of them, or nowhere (just install).
+pub(crate) struct SettingsApp {
+    pub page: Page,
+    pub search: String,
+    pub last_search_jumped: String,
+    pub doc: ConfigDocument,
+    pub cfg: HyprConfig,
+    pub monitors: Vec<MonitorInfo>,
+    pub css: Arc<RwLock<CssStyleSheet>>,
+    pub font: chickenwm_core::fonts::EguiFont,
+    pub installed_fonts: Option<Vec<String>>,
+    pub current_fonts: Option<(Instant, Vec<String>)>,
+    pub font_filter: String,
+    pub font_confirm: Option<FontRequest>,
+    pub font_job: Option<Arc<std::sync::Mutex<FontJob>>>,
+    pub status_banner: String,
+    pub status_seen: String,
+    pub status_at: Option<Instant>,
+
+    pub new_exec_once: String,
+
+    pub show_css_editor: bool,
+    /// roobar.css `--islands` (each widget its own pill, or one background for the whole bar).
+    pub bar_islands: bool,
+    pub selected_css_file: String,
+    pub css_editor_buffer: String,
+
+    pub selected_bezier_idx: usize,
+    pub bezier_preview_t: f32,
+    pub last_tick: Instant,
+
+    pub bind_search: String,
+    pub recording_keybind: bool,
+    pub recorded_mods: String,
+    pub recorded_key: String,
+    pub new_bind_dispatcher: String,
+    pub new_bind_arg: String,
+
+    pub inspecting_crosshair: bool,
+    pub inspected_class: String,
+    pub inspected_title: String,
+    pub inspected_initial_title: String,
+    pub inspected_process: String,
+    pub new_rule_effect: String,
+
+    pub wallpaper_path_input: String,
+    pub wallpaper_transition: &'static str,
+
+    pub files_handler_active: bool,
+
+    pub theme_editor: theme_ui::ThemeEditor,
+    pub visuals_from: Option<CssStyleSheet>,
+    pub auto_dark: chickenwm_core::theme_tools::AutoDark,
+    pub log_selected: Option<std::path::PathBuf>,
+    pub log_filter: String,
+    pub log_errors_only: bool,
+    pub log_cache:
+        Option<(Instant, Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>, usize)>)>,
+    pub theme_file_path: String,
+    /// Multi-step undo history (oldest to newest).
+    pub undo: Vec<UndoEntry>,
+    pub show_undo_history: bool,
+    pub show_unsaved_diff: bool,
+    /// Every setting row: (page, label, hint), for search. Built on the first frame.
+    pub search_index: Option<Vec<(Page, String, String)>>,
+    /// Problems `config_check` found in chickenwm.conf.
+    pub config_issues: Vec<chickenwm_core::config_check::Issue>,
+}
+
+pub(crate) const TRANSITIONS: [&str; 4] = ["fade", "wipe", "outer", "grow"];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum FontTarget {
+pub(crate) enum FontTarget {
     One(&'static str),
     All,
     InstallOnly,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FontRequest {
-    font: chickenwm_core::fonts::NerdFont,
-    target: FontTarget,
+pub(crate) struct FontRequest {
+    pub font: chickenwm_core::fonts::NerdFont,
+    pub target: FontTarget,
 }
 
-struct FontJob {
-    request: FontRequest,
-    /// `None` while running.
-    result: Option<Result<usize, String>>,
+pub(crate) struct FontJob {
+    pub request: FontRequest,
+    pub result: Option<Result<usize, String>>,
 }
 
-/// First family of a CSS `font-family` list, for display.
-fn primary_family(list: &str) -> String {
-    chickenwm_core::fonts::css_families(list).into_iter().next().unwrap_or_else(|| "Default".to_string())
+pub(crate) fn primary_family(list: &str) -> String {
+    chickenwm_core::fonts::css_families(list)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Default".to_string())
 }
 
-fn bool_str(b: bool) -> &'static str {
-    if b { "true" } else { "false" }
+pub(crate) fn bool_str(b: bool) -> &'static str {
+    if b {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 impl SettingsApp {
-    fn new(doc: ConfigDocument, cfg: HyprConfig, css: Arc<RwLock<CssStyleSheet>>) -> Self {
+    pub(crate) fn new(
+        doc: ConfigDocument,
+        cfg: HyprConfig,
+        css: Arc<RwLock<CssStyleSheet>>,
+    ) -> Self {
         let wp = cfg.wallpapers.first();
         let wallpaper_transition = wp
-            .and_then(|w| TRANSITIONS.iter().copied().find(|t| t.eq_ignore_ascii_case(&w.transition)))
+            .and_then(|w| {
+                TRANSITIONS
+                    .iter()
+                    .copied()
+                    .find(|t| t.eq_ignore_ascii_case(&w.transition))
+            })
             .unwrap_or("fade");
-        // `chickenwm-settings --page appearance` opens a page directly.
         let mut args = std::env::args().skip_while(|a| a != "--page").skip(1);
         let page = args
             .next()
-            .and_then(|want| PAGES.iter().find(|p| p.title.replace(' ', "").eq_ignore_ascii_case(&want.replace(['-', '_', ' '], ""))))
+            .and_then(|want| {
+                PAGES.iter().find(|p| {
+                    p.title
+                        .replace(' ', "")
+                        .eq_ignore_ascii_case(&want.replace(['-', '_', ' '], ""))
+                })
+            })
             .map_or(Page::General, |p| p.page);
         Self {
             page,
-            search: String::new(),
+            search: std::env::var("CHICKENWM_SETTINGS_SEARCH").unwrap_or_default(),
+            last_search_jumped: String::new(),
             monitors: enumerate_monitors(),
             css,
             font: Default::default(),
@@ -258,8 +319,13 @@ impl SettingsApp {
             status_at: None,
             new_exec_once: String::new(),
             show_css_editor: false,
+            bar_islands: load_css_sheet("roobar.css")
+                .ok()
+                .and_then(|s| s.custom_properties.get("--islands").cloned())
+                .is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "no" | "off" | "0" | "none")),
             selected_css_file: "launcher.css".to_string(),
-            css_editor_buffer: std::fs::read_to_string(config_dir().join("launcher.css")).unwrap_or_default(),
+            css_editor_buffer: std::fs::read_to_string(config_dir().join("launcher.css"))
+                .unwrap_or_default(),
             selected_bezier_idx: 0,
             bezier_preview_t: 0.0,
             last_tick: Instant::now(),
@@ -272,29 +338,160 @@ impl SettingsApp {
             inspecting_crosshair: false,
             inspected_class: String::new(),
             inspected_title: String::new(),
+            inspected_initial_title: String::new(),
+            inspected_process: String::new(),
             new_rule_effect: "float".to_string(),
             wallpaper_path_input: wp.map(|w| w.path.clone()).unwrap_or_default(),
             wallpaper_transition,
             files_handler_active: is_files_handler_registered(),
             theme_editor: theme_ui::ThemeEditor::new(&cfg.theme),
             visuals_from: None,
+            auto_dark: cfg.theme.auto_dark.clone(),
+            log_selected: None,
+            log_filter: String::new(),
+            log_errors_only: false,
+            log_cache: None,
+            theme_file_path: config_dir()
+                .join("my-theme.chickentheme")
+                .display()
+                .to_string(),
+            undo: Vec::new(),
+            show_undo_history: false,
+            show_unsaved_diff: false,
+            search_index: None,
+            config_issues: chickenwm_core::config_check::validate_user_config().unwrap_or_default(),
             doc,
             cfg,
         }
     }
 
-    /// Saves the `ConfigDocument` losslessly to chickenwm.conf and tells the running daemons.
-    fn sync_config_and_notify(&mut self) {
+    /// Computes a diff of any unsaved changes (theme draft, CSS editor buffer, or AST vs disk).
+    pub(crate) fn unsaved_diff(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.theme_editor.draft != self.cfg.theme {
+            if self.theme_editor.draft.preset != self.cfg.theme.preset {
+                out.push(format!("- theme.preset = {}", self.cfg.theme.preset));
+                out.push(format!("+ theme.preset = {}", self.theme_editor.draft.preset));
+            }
+            if self.theme_editor.draft.mode != self.cfg.theme.mode {
+                out.push(format!("- theme.mode = {}", self.cfg.theme.mode.as_str()));
+                out.push(format!(
+                    "+ theme.mode = {}",
+                    self.theme_editor.draft.mode.as_str()
+                ));
+            }
+            if self.theme_editor.draft.accent != self.cfg.theme.accent {
+                out.push(format!(
+                    "- theme.accent = {}",
+                    chickenwm_core::theme::css(self.cfg.theme.accent)
+                ));
+                out.push(format!(
+                    "+ theme.accent = {}",
+                    chickenwm_core::theme::css(self.theme_editor.draft.accent)
+                ));
+            }
+            if self.theme_editor.draft.icon_theme != self.cfg.theme.icon_theme {
+                out.push(format!(
+                    "- theme.icon_theme = {}",
+                    self.cfg.theme.icon_theme
+                ));
+                out.push(format!(
+                    "+ theme.icon_theme = {}",
+                    self.theme_editor.draft.icon_theme
+                ));
+            }
+        }
+        if self.show_css_editor {
+            let disk_css = std::fs::read_to_string(config_dir().join(&self.selected_css_file))
+                .unwrap_or_default();
+            if disk_css != self.css_editor_buffer {
+                for l in compute_line_diff(&disk_css, &self.css_editor_buffer)
+                    .into_iter()
+                    .take(16)
+                {
+                    out.push(format!("[{}] {l}", self.selected_css_file));
+                }
+            }
+        }
+        let disk_conf =
+            std::fs::read_to_string(config_dir().join("chickenwm.conf")).unwrap_or_default();
+        let mem_conf = self.doc.to_lossless_string();
+        if !disk_conf.is_empty() && disk_conf.trim() != mem_conf.trim() {
+            out.extend(compute_line_diff(&disk_conf, &mem_conf).into_iter().take(20));
+        }
+        out
+    }
+
+    pub(crate) fn sync_config_and_notify_labeled(&mut self, label: &str) {
+        let path = config_dir().join("chickenwm.conf");
+        let before = std::fs::read_to_string(&path).unwrap_or_default();
         if let Err(e) = save_config_document(&self.doc) {
             self.status_banner = format!("Couldn't save chickenwm.conf: {e}");
             return;
         }
+        if let Ok(now) = std::fs::read_to_string(&path) {
+            if now != before {
+                let diff = compute_line_diff(&before, &now);
+                self.undo.push(UndoEntry {
+                    label: label.to_string(),
+                    before,
+                    diff,
+                });
+                if self.undo.len() > 30 {
+                    self.undo.remove(0);
+                }
+            }
+        }
+        self.config_issues =
+            chickenwm_core::config_check::validate_user_config().unwrap_or_default();
         let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ReloadConfig);
         let _ = send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::ReloadConfig);
         self.status_banner = "Saved".to_string();
     }
 
-    fn send_shell_config(&self) {
+    /// Reverts `chickenwm.conf` back to the state before `self.undo[step_idx]`, truncating newer steps.
+    pub(crate) fn undo_to_step(&mut self, step_idx: usize) {
+        if step_idx >= self.undo.len() {
+            self.status_banner = "Nothing to undo".to_string();
+            return;
+        }
+        let target = self.undo[step_idx].clone();
+        self.undo.truncate(step_idx);
+        let path = config_dir().join("chickenwm.conf");
+        if let Err(e) = std::fs::write(&path, &target.before) {
+            self.status_banner = format!("Couldn't undo: {e}");
+            return;
+        }
+        match chickenwm_core::config::load_or_init_config() {
+            Ok((doc, cfg)) => {
+                let theme_changed = cfg.theme != self.cfg.theme;
+                self.theme_editor = theme_ui::ThemeEditor::new(&cfg.theme);
+                self.auto_dark = cfg.theme.auto_dark.clone();
+                if theme_changed {
+                    let _ = chickenwm_core::theme::apply_theme(&cfg.theme);
+                }
+                self.doc = doc;
+                self.cfg = cfg;
+                let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ReloadConfig);
+                let _ = send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::ReloadConfig);
+                self.config_issues =
+                    chickenwm_core::config_check::validate_user_config().unwrap_or_default();
+                self.status_banner = format!("Reverted: {}", target.label);
+            }
+            Err(e) => self.status_banner = format!("Undo wrote the file but it doesn't load: {e}"),
+        }
+    }
+
+    pub(crate) fn undo_last_change(&mut self) {
+        if self.undo.is_empty() {
+            self.status_banner = "Nothing to undo".to_string();
+            return;
+        }
+        let last = self.undo.len() - 1;
+        self.undo_to_step(last);
+    }
+
+    pub(crate) fn send_shell_config(&self) {
         let _ = send_ipc_command_blocking(
             PIPE_NAME_DAEMON,
             &IpcCommand::SetShellConfig {
@@ -305,9 +502,7 @@ impl SettingsApp {
         );
     }
 
-    /// Writes (or removes) the default-file-manager registry keys directly, so the toggle works
-    /// even when the daemon isn't running, then persists the choice and tells the daemon.
-    fn apply_files_handler(&mut self, enable: bool) {
+    pub(crate) fn apply_files_handler(&mut self, enable: bool) {
         if let Err(e) = register_files_shell_handler(enable, None) {
             self.status_banner = format!("Could not change the default file manager: {e}");
             self.files_handler_active = is_files_handler_registered();
@@ -315,8 +510,9 @@ impl SettingsApp {
         }
         self.files_handler_active = is_files_handler_registered();
         self.cfg.misc.register_files_handler = enable;
-        self.doc.set_category_key("misc", "register_files_handler", bool_str(enable));
-        self.sync_config_and_notify();
+        self.doc
+            .set_category_key("misc", "register_files_handler", bool_str(enable));
+        self.sync_config_and_notify_labeled("Default file manager");
         self.send_shell_config();
         self.status_banner = if enable {
             "ChickenWM Files is now the default file manager".to_string()
@@ -325,9 +521,7 @@ impl SettingsApp {
         };
     }
 
-    /// Turns "start as administrator" on or off. Registering the scheduled task needs one UAC
-    /// approval; afterwards the shell starts elevated at every sign-in without a prompt.
-    fn apply_run_as_admin(&mut self, enable: bool) {
+    pub(crate) fn apply_run_as_admin(&mut self, enable: bool) {
         let exe = match std::env::current_exe() {
             Ok(mut p) => {
                 p.set_file_name("chickenwm-rooster.exe");
@@ -338,33 +532,40 @@ impl SettingsApp {
                 return;
             }
         };
-        let flag = if enable { "--install-admin-task" } else { "--remove-admin-task" };
+        let flag = if enable {
+            "--install-admin-task"
+        } else {
+            "--remove-admin-task"
+        };
         match chickenwm_core::elevation::run_elevated(&exe, &[flag], true) {
             Ok(0) => {
                 self.cfg.misc.run_as_admin = enable;
-                self.doc.set_category_key("misc", "run_as_admin", bool_str(enable));
-                self.sync_config_and_notify();
+                self.doc
+                    .set_category_key("misc", "run_as_admin", bool_str(enable));
+                self.sync_config_and_notify_labeled("Run as administrator");
                 self.status_banner = if enable {
                     "ChickenWM will start as administrator at your next sign-in".to_string()
                 } else {
                     "ChickenWM will start normally again".to_string()
                 };
             }
-            Ok(code) => self.status_banner = format!("Couldn't change the administrator task (code {code})"),
+            Ok(code) => {
+                self.status_banner = format!("Couldn't change the administrator task (code {code})")
+            }
             Err(_) => self.status_banner = "Administrator approval was cancelled".to_string(),
         }
     }
 
-    /// Applies the edited theme everywhere and records it in chickenwm.conf.
-    fn apply_system_theme(&mut self) {
+    pub(crate) fn apply_system_theme(&mut self) {
         let theme = self.theme_editor.draft.clone();
         match chickenwm_core::theme::apply_theme(&theme) {
             Ok(palette) => {
                 chickenwm_core::theme::write_theme_keys(&mut self.doc, &theme, &palette);
                 let border = chickenwm_core::theme::hypr_color(palette.active_border());
-                self.cfg.general.col_active_border = chickenwm_core::config::BorderColorSpec::parse(&border);
+                self.cfg.general.col_active_border =
+                    chickenwm_core::config::BorderColorSpec::parse(&border);
                 self.cfg.theme = theme;
-                self.sync_config_and_notify();
+                self.sync_config_and_notify_labeled("Apply system theme");
                 self.theme_editor.invalidate_icons();
                 self.status_banner = "Theme applied".to_string();
             }
@@ -372,981 +573,17 @@ impl SettingsApp {
         }
     }
 
-    // ───────────────────────────── General ─────────────────────────────
-
-    fn page_general(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        let mut shell_changed = false;
-        kit::group(ui, kit, "Shell", |g| {
-            g.row("Use ChickenWM as the Windows shell", "Starts ChickenWM instead of Explorer when you sign in.", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.misc.replace_winlogon_shell).changed() {
-                    self.doc.set_category_key("misc", "replace_winlogon_shell", bool_str(self.cfg.misc.replace_winlogon_shell));
-                    shell_changed = true;
-                }
-            });
-            g.row("Hide Explorer's taskbar and desktop", "Closes explorer.exe while ChickenWM runs; roobar takes its place.", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.misc.suppress_explorer).changed() {
-                    self.doc.set_category_key("misc", "suppress_explorer", bool_str(self.cfg.misc.suppress_explorer));
-                    shell_changed = true;
-                }
-            });
-        });
-        if shell_changed {
-            self.sync_config_and_notify();
-            self.send_shell_config();
-        }
-
-        let mut want_admin = self.cfg.misc.run_as_admin;
-        let mut restart_admin = false;
-        let elevated = chickenwm_core::elevation::is_elevated();
-        kit::group(ui, kit, "Administrator", |g| {
-            g.row("Run ChickenWM as administrator", "Starts elevated at every sign-in, so windows of administrator programs can be tiled. Asks for approval once. Apps you launch from ChickenWM also run as administrator.", |ui| {
-                kit::toggle(ui, kit, &mut want_admin);
-            });
-            g.row("Status", "", |ui| {
-                if !elevated && kit::button(ui, kit, "Restart as administrator", true).clicked() {
-                    restart_admin = true;
-                }
-                if elevated {
-                    kit::chip(ui, kit, "● Running as administrator", Color32::from_rgb(52, 199, 89));
-                } else {
-                    kit::chip(ui, kit, "Normal privileges", kit.sub);
-                }
-            });
-        });
-        if want_admin != self.cfg.misc.run_as_admin {
-            self.apply_run_as_admin(want_admin);
-        }
-        if restart_admin {
-            self.status_banner = match send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::RestartElevated) {
-                Ok(chickenwm_core::ipc::IpcResponse::Error { message }) => format!("Not restarted: {message}"),
-                Ok(_) => "Restarting ChickenWM as administrator".to_string(),
-                Err(_) => "ChickenWM isn't running".to_string(),
-            };
-        }
-
-        let mut want = self.cfg.misc.register_files_handler;
-        let mut repair = false;
-        let mut open_files = false;
-        kit::group(ui, kit, "Default file manager", |g| {
-            g.row("Open folders in ChickenWM Files", "Folders, drives, Win + E and File Explorer shortcuts. Just for you, no admin needed.", |ui| {
-                kit::toggle(ui, kit, &mut want);
-            });
-            g.row("Status", "", |ui| {
-                if kit::button(ui, kit, "Open Files", false).clicked() {
-                    open_files = true;
-                }
-                if !self.files_handler_active && self.cfg.misc.register_files_handler && kit::button(ui, kit, "Repair", true).clicked() {
-                    repair = true;
-                }
-                if self.files_handler_active {
-                    kit::chip(ui, kit, "● Active", Color32::from_rgb(52, 199, 89));
-                } else if self.cfg.misc.register_files_handler {
-                    kit::chip(ui, kit, "Registry keys missing", Color32::from_rgb(255, 149, 0));
-                } else {
-                    kit::chip(ui, kit, "Explorer opens folders", kit.sub);
-                }
-            });
-        });
-        if want != self.cfg.misc.register_files_handler {
-            self.apply_files_handler(want);
-        }
-        if repair {
-            self.apply_files_handler(true);
-        }
-        if open_files {
-            if let Ok(mut exe) = std::env::current_exe() {
-                exe.set_file_name("chickenwm-files.exe");
-                if let Err(e) = std::process::Command::new(&exe).spawn() {
-                    self.status_banner = format!("Couldn't start {}: {e}", exe.display());
-                }
-            }
-        }
-
-        let mut remove = None;
-        let mut add = false;
-        kit::group(ui, kit, "Open at startup", |g| {
-            for (idx, cmd) in self.cfg.exec_once.iter().enumerate() {
-                g.row(cmd, "", |ui| {
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(idx);
-                    }
-                });
-            }
-            g.row("Add a program", "A command line, e.g. chickenbrowser.exe", |ui| {
-                if kit::button(ui, kit, "Add", true).clicked() {
-                    add = true;
-                }
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.new_exec_once).desired_width(200.0).hint_text("program.exe --args"));
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    add = true;
-                }
-            });
-        });
-        if let Some(i) = remove {
-            self.cfg.exec_once.remove(i);
-            let vals = self.cfg.exec_once.clone();
-            self.doc.replace_directives("exec-once", &vals);
-            self.sync_config_and_notify();
-        }
-        if add && !self.new_exec_once.trim().is_empty() {
-            let cmd = self.new_exec_once.trim().to_string();
-            self.cfg.exec_once.push(cmd.clone());
-            self.doc.add_directive("exec-once", &cmd);
-            self.new_exec_once.clear();
-            self.sync_config_and_notify();
-        }
-
-        let mut restore = false;
-        kit::group(ui, kit, "Recovery", |g| {
-            g.row("Restore Explorer", "Brings back Explorer as the shell right now. Hotkey anytime: Ctrl + Alt + Shift + Esc.", |ui| {
-                let btn = egui::Button::new(RichText::new("Restore").color(Color32::WHITE).size(13.0))
-                    .fill(kit.danger)
-                    .corner_radius(CornerRadius::same(7))
-                    .min_size(Vec2::new(0.0, 26.0));
-                if ui.add(btn).clicked() {
-                    restore = true;
-                }
-            });
-        });
-        if restore {
-            let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::RestoreExplorer);
-            trigger_emergency_restore(false);
-            self.status_banner = "Explorer restored".to_string();
-        }
-    }
-
-    // ───────────────────────────── Appearance ─────────────────────────────
-
-    fn page_appearance(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        let applied = self.cfg.theme.clone();
-        if self.theme_editor.ui(ui, kit, &applied) {
-            self.apply_system_theme();
-        }
-        if let Some((app, mode)) = theme_ui::per_app_ui(ui, kit, &self.cfg.theme) {
-            match chickenwm_core::theme::set_app_mode(app, mode) {
-                Ok(theme) => {
-                    // Keep our AST in sync with what the provider just saved.
-                    self.doc.set_category_key("theme", "app_modes", &theme.app_modes_string());
-                    self.cfg.theme.app_modes = theme.app_modes;
-                    self.theme_editor.draft.app_modes = self.cfg.theme.app_modes.clone();
-                    self.status_banner = format!("{app}: {}", mode.as_str());
-                }
-                Err(e) => self.status_banner = format!("Couldn't change {app}: {e}"),
-            }
-        }
-
-        let mut changed = false;
-        let mut border_changed = false;
-        kit::group(ui, kit, "Windows", |g| {
-            g.row("Active border", "Two colors make a gradient at the given angle.", |ui| {
-                let b = &mut self.cfg.general.col_active_border;
-                if ui.add(egui::DragValue::new(&mut b.angle_deg).range(0.0..=360.0).suffix("°").speed(1.0)).changed() {
-                    border_changed = true;
-                }
-                let sec = b.secondary.unwrap_or(b.primary);
-                let mut c2 = [sec.r, sec.g, sec.b, sec.a];
-                if ui.color_edit_button_srgba_unmultiplied(&mut c2).on_hover_text("Second color").changed() {
-                    b.secondary = Some(RgbaColor { r: c2[0], g: c2[1], b: c2[2], a: c2[3] });
-                    border_changed = true;
-                }
-                let mut c1 = [b.primary.r, b.primary.g, b.primary.b, b.primary.a];
-                if ui.color_edit_button_srgba_unmultiplied(&mut c1).on_hover_text("First color").changed() {
-                    b.primary = RgbaColor { r: c1[0], g: c1[1], b: c1[2], a: c1[3] };
-                    border_changed = true;
-                }
-            });
-            g.row("Border rotation speed", "0 keeps the gradient still.", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.decoration.border_anim_speed, 0.0..=5.0).max_decimals(2)).changed() {
-                    self.doc.set_category_key("decoration", "border_anim_speed", &format!("{:.2}", self.cfg.decoration.border_anim_speed));
-                    changed = true;
-                }
-            });
-            g.row("Corner rounding", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.decoration.rounding, 0..=28).suffix(" px")).changed() {
-                    self.doc.set_category_key("decoration", "rounding", &self.cfg.decoration.rounding.to_string());
-                    changed = true;
-                }
-            });
-            g.row("Focused window opacity", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.decoration.active_opacity, 0.3..=1.0).max_decimals(2)).changed() {
-                    self.doc.set_category_key("decoration", "active_opacity", &format!("{:.2}", self.cfg.decoration.active_opacity));
-                    changed = true;
-                }
-            });
-            g.row("Other windows' opacity", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.decoration.inactive_opacity, 0.3..=1.0).max_decimals(2)).changed() {
-                    self.doc.set_category_key("decoration", "inactive_opacity", &format!("{:.2}", self.cfg.decoration.inactive_opacity));
-                    changed = true;
-                }
-            });
-            g.row("Backdrop blur", "Acrylic / Mica behind supported windows.", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.decoration.blur_enabled).changed() {
-                    self.doc.set_category_key("decoration", "blur_enabled", bool_str(self.cfg.decoration.blur_enabled));
-                    changed = true;
-                }
-            });
-        });
-        if border_changed {
-            let spec = self.cfg.general.col_active_border.to_hypr_string();
-            self.doc.set_category_key("general", "col.active_border", &spec);
-            changed = true;
-        }
-        if changed {
-            self.sync_config_and_notify();
-        }
-
-        let mut save_css = false;
-        let mut load_css: Option<&'static str> = None;
-        kit::group(ui, kit, "Advanced", |g| {
-            g.row("Edit stylesheets", "Fonts, sizes and colors of each app, in CSS. Changes show up live.", |ui| {
-                kit::toggle(ui, kit, &mut self.show_css_editor);
-            });
-            if self.show_css_editor {
-                g.custom(|ui| {
-                    ui.horizontal(|ui| {
-                        let files: [(&str, &str); 6] = [
-                            ("roobar.css", "Bar"),
-                            ("launcher.css", "Launcher"),
-                            ("files.css", "Files"),
-                            ("settings.css", "Settings"),
-                            ("browser.css", "Browser"),
-                            ("notifications.css", "Notifications"),
-                        ];
-                        let mut sel = files.iter().position(|f| f.0 == self.selected_css_file).unwrap_or(0);
-                        let opts: Vec<(usize, &str)> = files.iter().enumerate().map(|(i, f)| (i, f.1)).collect();
-                        if kit::segmented(ui, kit, &mut sel, &opts) {
-                            load_css = Some(files[sel].0);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if kit::button(ui, kit, "Save", true).clicked() {
-                                save_css = true;
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), 280.0],
-                            egui::TextEdit::multiline(&mut self.css_editor_buffer).code_editor().desired_rows(14),
-                        );
-                    });
-                });
-            }
-        });
-        if let Some(f) = load_css {
-            self.selected_css_file = f.to_string();
-            self.css_editor_buffer = std::fs::read_to_string(config_dir().join(f)).unwrap_or_default();
-        }
-        if save_css {
-            let path = config_dir().join(&self.selected_css_file);
-            match std::fs::write(&path, &self.css_editor_buffer) {
-                Ok(()) => {
-                    let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ReloadConfig);
-                    self.status_banner = format!("Saved {}", self.selected_css_file);
-                }
-                Err(e) => self.status_banner = format!("Couldn't save {}: {e}", self.selected_css_file),
-            }
-        }
-    }
-
-    // ───────────────────────────── Wallpaper ─────────────────────────────
-
-    fn page_wallpaper(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        let mut apply = false;
-        kit::group(ui, kit, "Wallpaper", |g| {
-            g.row("Image or shader", "A PNG / JPEG / WebP picture, or a .wgsl shader.", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.wallpaper_path_input).desired_width(260.0).hint_text("~/Pictures/wall.png"));
-            });
-            g.row("Transition", "", |ui| {
-                let opts: Vec<(&'static str, &str)> = TRANSITIONS.iter().map(|t| (*t, *t)).collect();
-                kit::segmented(ui, kit, &mut self.wallpaper_transition, &opts);
-            });
-            g.row("", "", |ui| {
-                if kit::button(ui, kit, "Set wallpaper", true).clicked() {
-                    apply = true;
-                }
-            });
-        });
-        if apply {
-            let _ = send_ipc_command_blocking(
-                PIPE_NAME_PAPER,
-                &IpcCommand::SetWallpaper {
-                    monitor: None,
-                    path: self.wallpaper_path_input.clone(),
-                    transition: Some(self.wallpaper_transition.to_string()),
-                },
-            );
-            self.doc.replace_directives("wallpaper", &[format!(", {}, {}", self.wallpaper_path_input, self.wallpaper_transition)]);
-            self.sync_config_and_notify();
-        }
-
-        kit::group(ui, kit, "Layers", |g| {
-            if self.cfg.paper.layers.is_empty() {
-                g.custom(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(
-                                "Stack images, colors and shaders, with chroma keying, in chickenwm.conf:\n\npaper {\n    layer = image, ~/bg/sky.png\n    layer = image, ~/bg/character.png, key = rgb(00ff00), tolerance = 0.25\n}\n\nLayers replace the single wallpaper above. See docs/STYLING.md.",
-                            )
-                            .size(12.5)
-                            .color(kit.sub),
-                        )
-                        .wrap(),
-                    );
-                });
-            } else {
-                for (i, l) in self.cfg.paper.layers.iter().enumerate() {
-                    let kind = match l.kind {
-                        PaperLayerKind::Image => "Image",
-                        PaperLayerKind::Generated => "Theme wallpaper",
-                        PaperLayerKind::Color => "Color",
-                        PaperLayerKind::Shader => "Shader",
-                    };
-                    let mut hint = format!("{}{} · {} · {:.0}%", if l.source.is_empty() { "" } else { &l.source }, if l.source.is_empty() { "" } else { " ·" }, l.blend, l.opacity * 100.0);
-                    if let Some(k) = l.key {
-                        hint.push_str(&format!(" · key {} ±{:.2}", chickenwm_core::theme::css(k), l.tolerance));
-                    }
-                    g.row(&format!("{}. {kind}", i + 1), &hint, |ui| {
-                        if l.key.is_some() {
-                            kit::chip(ui, kit, "Chroma key", kit.accent);
-                        }
-                    });
-                }
-            }
-        });
-    }
-
-    // ───────────────────────────── Displays ─────────────────────────────
-
-    fn page_displays(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        let mut refresh = false;
-        kit::group(ui, kit, "Displays", |g| {
-            for m in &self.monitors {
-                let hint = if m.adapter_name.is_empty() { String::new() } else { m.adapter_name.clone() };
-                g.row(&m.name, &hint, |ui| {
-                    ui.label(
-                        RichText::new(format!("{} × {} · {} Hz · {:.0}%", m.width, m.height, m.refresh_rate_hz, m.dpi_scale * 100.0))
-                            .color(kit.sub),
-                    );
-                    if m.is_primary {
-                        kit::chip(ui, kit, "Main", kit.accent);
-                    }
-                });
-            }
-            g.row("", "", |ui| {
-                if kit::button(ui, kit, "Detect displays", false).clicked() {
-                    refresh = true;
-                }
-            });
-        });
-        if refresh {
-            self.monitors = enumerate_monitors();
-        }
-
-        let native_hz = max_native_refresh_rate(&self.monitors);
-        let mut follow_native = self.cfg.misc.fps_limit == 0;
-        let mut fps_changed = false;
-        let mut vfr_changed = false;
-        kit::group(ui, kit, "Frame rate", |g| {
-            g.row("Match the display", &format!("Animations run at {native_hz} Hz, in step with the screen."), |ui| {
-                if kit::toggle(ui, kit, &mut follow_native).changed() {
-                    self.cfg.misc.fps_limit = if follow_native { 0 } else { native_hz };
-                    fps_changed = true;
-                }
-            });
-            if !follow_native {
-                g.row("Frame rate limit", "", |ui| {
-                    if ui.add(egui::Slider::new(&mut self.cfg.misc.fps_limit, 30..=500).suffix(" FPS")).changed() {
-                        fps_changed = true;
-                    }
-                });
-                g.custom(|ui| {
-                    ui.horizontal(|ui| {
-                        for preset in [60u32, 120, 144, 165, 240, 360] {
-                            if kit::button(ui, kit, &format!("{preset}"), self.cfg.misc.fps_limit == preset).clicked() {
-                                self.cfg.misc.fps_limit = preset;
-                                fps_changed = true;
-                            }
-                        }
-                    });
-                });
-            }
-            g.row("Save power when idle", "Stops redrawing when nothing moves (variable frame rate).", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.misc.vfr).changed() {
-                    vfr_changed = true;
-                }
-            });
-        });
-        if vfr_changed {
-            self.doc.set_category_key("misc", "vfr", bool_str(self.cfg.misc.vfr));
-            self.sync_config_and_notify();
-        }
-        if fps_changed {
-            self.doc.set_category_key("misc", "fps_limit", &self.cfg.misc.fps_limit.to_string());
-            self.sync_config_and_notify();
-            let fps = (self.cfg.misc.fps_limit != 0).then_some(self.cfg.misc.fps_limit);
-            let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::SetFramerate(fps));
-        }
-
-        let mut mode_changed = false;
-        kit::group(ui, kit, "Compositor", |g| {
-            g.row("Engine", "Standard is safe with anti-cheat games. The DWM hook injects into Windows' compositor (experimental).", |ui| {
-                mode_changed = kit::segmented(ui, kit, &mut self.cfg.misc.dwm_hook_enabled, &[(false, "Standard"), (true, "DWM hook")]);
-            });
-        });
-        if mode_changed {
-            self.doc.set_category_key("misc", "dwm_hook_enabled", bool_str(self.cfg.misc.dwm_hook_enabled));
-            self.sync_config_and_notify();
-            let _ = send_ipc_command_blocking(
-                PIPE_NAME_DAEMON,
-                &IpcCommand::SetCompositorMode { dwm_hook_enabled: self.cfg.misc.dwm_hook_enabled },
-            );
-            self.status_banner = "Compositor engine changed: ChickenWM modules restarted".to_string();
-        }
-    }
-
-    // ───────────────────────────── Tiling ─────────────────────────────
-
-    fn page_tiling(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        let mut changed = false;
-        kit::group(ui, kit, "Layout", |g| {
-            g.row("Layout", "Dwindle splits space in a spiral; Master keeps one big window and a stack.", |ui| {
-                let mut sel: &str = if self.cfg.general.layout == "master" { "master" } else { "dwindle" };
-                if kit::segmented(ui, kit, &mut sel, &[("dwindle", "Dwindle"), ("master", "Master")]) {
-                    self.cfg.general.layout = sel.to_string();
-                    self.doc.set_category_key("general", "layout", sel);
-                    changed = true;
-                }
-            });
-            g.row("Gaps between windows", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.general.gaps_in, 0..=40).suffix(" px")).changed() {
-                    self.doc.set_category_key("general", "gaps_in", &self.cfg.general.gaps_in.to_string());
-                    changed = true;
-                }
-            });
-            g.row("Gaps at screen edges", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.general.gaps_out, 0..=60).suffix(" px")).changed() {
-                    self.doc.set_category_key("general", "gaps_out", &self.cfg.general.gaps_out.to_string());
-                    changed = true;
-                }
-            });
-            g.row("Border width", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.general.border_size, 0..=12).suffix(" px")).changed() {
-                    self.doc.set_category_key("general", "border_size", &self.cfg.general.border_size.to_string());
-                    changed = true;
-                }
-            });
-        });
-        kit::group(ui, kit, "Dwindle", |g| {
-            g.row("Split ratio", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.dwindle.default_split_ratio, 0.4..=1.6).max_decimals(2)).changed() {
-                    self.doc.set_category_key("dwindle", "default_split_ratio", &format!("{:.2}", self.cfg.dwindle.default_split_ratio));
-                    changed = true;
-                }
-            });
-            g.row("Keep split direction", "A split keeps its direction when windows are resized.", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.dwindle.preserve_split).changed() {
-                    self.doc.set_category_key("dwindle", "preserve_split", bool_str(self.cfg.dwindle.preserve_split));
-                    changed = true;
-                }
-            });
-        });
-        kit::group(ui, kit, "Master", |g| {
-            g.row("Master area size", "", |ui| {
-                if ui.add(egui::Slider::new(&mut self.cfg.master.mfact, 0.25..=0.75).max_decimals(2)).changed() {
-                    self.doc.set_category_key("master", "mfact", &format!("{:.2}", self.cfg.master.mfact));
-                    changed = true;
-                }
-            });
-        });
-        kit::group(ui, kit, "Behavior", |g| {
-            g.row("No gaps for a single window", "", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.dwindle.smart_gaps).changed() {
-                    let v = bool_str(self.cfg.dwindle.smart_gaps);
-                    self.cfg.master.smart_gaps = self.cfg.dwindle.smart_gaps;
-                    self.doc.set_category_key("dwindle", "smart_gaps", v);
-                    self.doc.set_category_key("master", "smart_gaps", v);
-                    changed = true;
-                }
-            });
-            g.row("Hide title bars", "Removes the Windows title bar from tiled windows.", |ui| {
-                if kit::toggle(ui, kit, &mut self.cfg.general.no_titlebars).changed() {
-                    self.doc.set_category_key("general", "no_titlebars", bool_str(self.cfg.general.no_titlebars));
-                    changed = true;
-                }
-            });
-        });
-        if changed {
-            self.sync_config_and_notify();
-        }
-    }
-
-    // ───────────────────────────── Animations ─────────────────────────────
-
-    fn page_animations(&mut self, ui: &mut egui::Ui, kit: &Kit, dt: f32) {
-        if self.cfg.beziers.is_empty() {
-            self.cfg.beziers.push(BezierCurve { name: "myBezier".to_string(), x0: 0.05, y0: 0.9, x1: 0.1, y1: 1.05 });
-        }
-        if self.selected_bezier_idx >= self.cfg.beziers.len() {
-            self.selected_bezier_idx = 0;
-        }
-        self.bezier_preview_t = (self.bezier_preview_t + dt * 0.7) % 1.3;
-        let mut changed = false;
-        kit::group(ui, kit, "Easing curves", |g| {
-            g.row("Curve", "", |ui| {
-                let names: Vec<(usize, String)> = self.cfg.beziers.iter().map(|b| b.name.clone()).enumerate().collect();
-                let opts: Vec<(usize, &str)> = names.iter().map(|(i, n)| (*i, n.as_str())).collect();
-                kit::segmented(ui, kit, &mut self.selected_bezier_idx, &opts);
-            });
-            let curve = &mut self.cfg.beziers[self.selected_bezier_idx];
-            for (label, v, range) in [
-                ("Point 1 · x", &mut curve.x0, 0.0..=1.0),
-                ("Point 1 · y", &mut curve.y0, -0.5..=1.5),
-                ("Point 2 · x", &mut curve.x1, 0.0..=1.0),
-                ("Point 2 · y", &mut curve.y1, -0.5..=1.5),
-            ] {
-                g.row(label, "", |ui| {
-                    changed |= ui.add(egui::Slider::new(v, range).max_decimals(2)).changed();
-                });
-            }
-            let curve = curve.clone();
-            let t = self.bezier_preview_t.min(1.0);
-            g.custom(|ui| {
-                ui.horizontal(|ui| {
-                    // Curve plot.
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(200.0, 150.0), egui::Sense::hover());
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, CornerRadius::same(8), kit.bg);
-                    let to_screen = |u: f32, v: f32| egui::pos2(rect.left() + 16.0 + u * (rect.width() - 32.0), rect.bottom() - 22.0 - v.clamp(-0.3, 1.3) * (rect.height() - 44.0));
-                    painter.line_segment([to_screen(0.0, 0.0), to_screen(1.0, 1.0)], Stroke::new(1.0_f32, kit.border));
-                    let pts: Vec<egui::Pos2> = (0..=48).map(|s| s as f32 / 48.0).map(|u| to_screen(u, curve.sample(u))).collect();
-                    painter.add(egui::Shape::line(pts, Stroke::new(2.5_f32, kit.accent)));
-                    painter.circle_filled(to_screen(t, curve.sample(t)), 4.5, kit.accent);
-                    ui.add_space(12.0);
-                    // A window sliding with the curve.
-                    let (prev, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(160.0), 150.0), egui::Sense::hover());
-                    let p = ui.painter_at(prev);
-                    p.rect_filled(prev, CornerRadius::same(8), kit.bg);
-                    let y = curve.sample(t);
-                    let w = 64.0;
-                    let x = prev.left() + 14.0 + y.clamp(-0.1, 1.2) * (prev.width() - w - 28.0);
-                    let win = egui::Rect::from_min_size(egui::pos2(x, prev.center().y - 26.0), Vec2::new(w, 52.0));
-                    p.rect(win, CornerRadius::same(7), kit.card, Stroke::new(2.0_f32, kit.accent), egui::StrokeKind::Inside);
-                    p.rect_filled(egui::Rect::from_min_size(win.min + Vec2::new(8.0, 9.0), Vec2::new(w * 0.55, 5.0)), CornerRadius::same(3), kit.sub);
-                });
-            });
-        });
-        kit::group(ui, kit, "Animations", |g| {
-            for rule in &self.cfg.animation_rules {
-                g.row(&rule.name, "", |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} ms · {}{}",
-                            (rule.speed * 100.0).round(),
-                            rule.curve,
-                            rule.style.as_deref().map(|s| format!(" · {s}")).unwrap_or_default()
-                        ))
-                        .color(kit.sub),
-                    );
-                    if !rule.enabled {
-                        kit::chip(ui, kit, "Off", kit.sub);
-                    }
-                });
-            }
-        });
-        if changed {
-            let lines: Vec<String> = self
-                .cfg
-                .beziers
-                .iter()
-                .map(|b| format!("{}, {:.2}, {:.2}, {:.2}, {:.2}", b.name, b.x0, b.y0, b.x1, b.y1))
-                .collect();
-            self.doc.replace_directives("bezier", &lines);
-            self.sync_config_and_notify();
-        }
-    }
-
-    // ───────────────────────────── Keyboard ─────────────────────────────
-
-    fn page_keyboard(&mut self, ui: &mut egui::Ui, kit: &Kit, ctx: &egui::Context) {
-        if self.recording_keybind {
-            ctx.input(|i| {
-                let mut mods = Vec::new();
-                if i.modifiers.command || i.modifiers.mac_cmd {
-                    mods.push("SUPER");
-                }
-                if i.modifiers.ctrl {
-                    mods.push("CTRL");
-                }
-                if i.modifiers.alt {
-                    mods.push("ALT");
-                }
-                if i.modifiers.shift {
-                    mods.push("SHIFT");
-                }
-                for ev in &i.events {
-                    if let egui::Event::Key { key, pressed: true, .. } = ev {
-                        if !mods.is_empty() {
-                            self.recorded_mods = mods.join(" ");
-                        }
-                        self.recorded_key = format!("{key:?}");
-                        self.recording_keybind = false;
-                    }
-                }
-            });
-        }
-
-        let mut add = false;
-        kit::group(ui, kit, "New shortcut", |g| {
-            g.row("Keys", if self.recording_keybind { "Press the keys now…" } else { "Type them, or record them." }, |ui| {
-                let label = if self.recording_keybind { "Cancel" } else { "Record" };
-                if kit::button(ui, kit, label, self.recording_keybind).clicked() {
-                    self.recording_keybind = !self.recording_keybind;
-                }
-                ui.add(egui::TextEdit::singleline(&mut self.recorded_key).desired_width(70.0));
-                ui.label(RichText::new("+").color(kit.sub));
-                ui.add(egui::TextEdit::singleline(&mut self.recorded_mods).desired_width(100.0));
-            });
-            g.row("Action", "A dispatcher and its argument, e.g. exec wt.exe.", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.new_bind_arg).desired_width(130.0));
-                ui.add(egui::TextEdit::singleline(&mut self.new_bind_dispatcher).desired_width(90.0));
-            });
-            g.row("", "", |ui| {
-                if kit::button(ui, kit, "Add shortcut", true).clicked() {
-                    add = true;
-                }
-            });
-        });
-        if add {
-            let rule = BindRule {
-                kind: BindKind::Press,
-                mods: self.recorded_mods.clone(),
-                key: self.recorded_key.clone(),
-                dispatcher: self.new_bind_dispatcher.clone(),
-                arg: self.new_bind_arg.clone(),
-            };
-            self.doc.add_directive("bind", &format!("{}, {}, {}, {}", rule.mods, rule.key, rule.dispatcher, rule.arg));
-            self.cfg.binds.push(rule);
-            self.sync_config_and_notify();
-        }
-
-        kit::search_field(ui, kit, &mut self.bind_search, "Search shortcuts");
-        ui.add_space(10.0);
-        let q = self.bind_search.trim().to_ascii_lowercase();
-        kit::group(ui, kit, "Shortcuts", |g| {
-            for b in &self.cfg.binds {
-                let hay = format!("{} {} {} {}", b.mods, b.key, b.dispatcher, b.arg).to_ascii_lowercase();
-                if !q.is_empty() && !hay.contains(&q) {
-                    continue;
-                }
-                g.custom(|ui| {
-                    ui.horizontal(|ui| {
-                        for m in b.mods.split(|c: char| c == ' ' || c == '_' || c == '+').filter(|m| !m.is_empty()) {
-                            kit::keycap(ui, kit, m);
-                        }
-                        kit::keycap(ui, kit, &b.key);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{} {}", b.dispatcher, b.arg).trim().to_string()).color(kit.sub));
-                        });
-                    });
-                });
-            }
-        });
-    }
-
-    // ───────────────────────────── Window rules ─────────────────────────────
-
-    fn page_window_rules(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        // Inspector: the next left click anywhere picks the window under the cursor.
-        if self.inspecting_crosshair {
-            unsafe {
-                if (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 {
-                    let mut pt = POINT::default();
-                    if GetCursorPos(&mut pt).is_ok() {
-                        let raw = WindowFromPoint(pt);
-                        let root = GetAncestor(raw, GA_ROOT);
-                        let target = if !root.0.is_null() { root } else { raw };
-                        if !target.0.is_null() {
-                            let mut cbuf = [0u16; 128];
-                            let clen = GetClassNameW(target, &mut cbuf);
-                            if clen > 0 {
-                                self.inspected_class = String::from_utf16_lossy(&cbuf[..clen as usize]);
-                            }
-                            let mut tbuf = [0u16; 256];
-                            let tlen = GetWindowTextW(target, &mut tbuf);
-                            self.inspected_title = if tlen > 0 { String::from_utf16_lossy(&tbuf[..tlen as usize]) } else { String::new() };
-                        }
-                    }
-                    self.inspecting_crosshair = false;
-                }
-            }
-        }
-
-        let mut add = false;
-        kit::group(ui, kit, "New rule", |g| {
-            g.row(
-                "Pick a window",
-                if self.inspecting_crosshair { "Now click any window…" } else { "Click the button, then click a window to read its class." },
-                |ui| {
-                    let label = if self.inspecting_crosshair { "Cancel" } else { "🎯 Pick" };
-                    if kit::button(ui, kit, label, self.inspecting_crosshair).clicked() {
-                        self.inspecting_crosshair = !self.inspecting_crosshair;
-                    }
-                },
-            );
-            let title_hint = if self.inspected_title.is_empty() { String::new() } else { format!("Title: {}", self.inspected_title) };
-            g.row("Window class", &title_hint, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.inspected_class).desired_width(200.0).hint_text("e.g. Taskmgr"));
-            });
-            g.row("Rule", "float · workspace 3 · opacity 0.9 · size 800 600 …", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.new_rule_effect).desired_width(200.0));
-            });
-            g.row("", "", |ui| {
-                if kit::button(ui, kit, "Add rule", true).clicked() {
-                    add = true;
-                }
-            });
-        });
-        if add && !self.inspected_class.trim().is_empty() {
-            let matcher = format!("class:^({})$", self.inspected_class.trim());
-            let raw = format!("{}, {}", self.new_rule_effect.trim(), matcher);
-            self.doc.add_directive("windowrulev2", &raw);
-            self.cfg.window_rules.push(WindowRuleV2 { effect: self.new_rule_effect.trim().to_string(), matcher });
-            self.sync_config_and_notify();
-        }
-
-        let mut remove = None;
-        kit::group(ui, kit, "Rules", |g| {
-            if self.cfg.window_rules.is_empty() {
-                g.row("No rules yet", "", |_| {});
-            }
-            for (i, r) in self.cfg.window_rules.iter().enumerate() {
-                g.row(&r.effect, &r.matcher, |ui| {
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-        });
-        if let Some(i) = remove {
-            self.cfg.window_rules.remove(i);
-            // Rules are rewritten as windowrulev2 lines (old `windowrule` lines use the same syntax).
-            let lines: Vec<String> = self.cfg.window_rules.iter().map(|r| format!("{}, {}", r.effect, r.matcher)).collect();
-            self.doc.replace_directives("windowrule", &[]);
-            self.doc.replace_directives("windowrulev2", &lines);
-            self.sync_config_and_notify();
-        }
-    }
-
-    // ───────────────────────────── frame ─────────────────────────────
-
-    // ───────────────────────────── Fonts ─────────────────────────────
-
-    fn page_fonts(&mut self, ui: &mut egui::Ui, kit: &Kit) {
-        use chickenwm_core::fonts::{self, FONT_TARGETS, NERD_FONTS};
-        let ctx = ui.ctx().clone();
-        let installed = self.installed_fonts.get_or_insert_with(|| fonts::installed_families(false)).clone();
-        let is_installed = |family: &str| installed.iter().any(|f| f.eq_ignore_ascii_case(family));
-
-        self.poll_font_job();
-        if self.current_fonts.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(1)) {
-            let current = FONT_TARGETS
-                .iter()
-                .map(|(file, _)| primary_family(&fonts::css_font_family(file).unwrap_or_default()))
-                .collect();
-            self.current_fonts = Some((Instant::now(), current));
-        }
-        let current_fonts = self.current_fonts.as_ref().map(|(_, c)| c.clone()).unwrap_or_default();
-        let busy =self.font_job.as_ref().map(|j| j.lock().map(|j| j.request.font.family).unwrap_or(""));
-
-        let mut picked: Option<(FontTarget, String)> = None;
-        let mut download: Option<FontRequest> = None;
-        let filter = self.font_filter.to_lowercase();
-
-        // One picker per module, plus "all" to set them in one go.
-        let mut font_menu = |ui: &mut egui::Ui, target: FontTarget, current: &str| {
-            egui::ComboBox::from_id_salt(("font", format!("{target:?}")))
-                .selected_text(current)
-                .width(230.0)
-                .height(380.0)
-                .show_ui(ui, |ui| {
-                    let missing: Vec<_> = NERD_FONTS.iter().filter(|n| !is_installed(n.family)).collect();
-                    if !missing.is_empty() {
-                        ui.label(RichText::new("Nerd Fonts (click to download)").size(11.0).color(kit.sub));
-                        for nf in missing {
-                            if filter.is_empty() || nf.family.to_lowercase().contains(&filter) {
-                                if ui.selectable_label(false, format!("⬇  {}", nf.family)).clicked() {
-                                    download = Some(FontRequest { font: *nf, target });
-                                }
-                            }
-                        }
-                        ui.separator();
-                    }
-                    ui.label(RichText::new("Installed").size(11.0).color(kit.sub));
-                    for family in installed.iter().filter(|f| filter.is_empty() || f.to_lowercase().contains(&filter)) {
-                        if ui.selectable_label(family == current, family).clicked() {
-                            picked = Some((target, family.clone()));
-                        }
-                    }
-                });
-        };
-
-        kit::group(ui, kit, "Fonts", |g| {
-            g.row("Search fonts", "Filters the lists below.", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.font_filter).hint_text("e.g. mono, nerd").desired_width(230.0));
-            });
-            g.row("Everything", "Use one font for every module below.", |ui| font_menu(ui, FontTarget::All, "Choose…"));
-            for ((file, label), current) in FONT_TARGETS.iter().zip(&current_fonts) {
-                let hint = if *file == "browser.css" { "Applies to new browser windows." } else { "" };
-                g.row(label, hint, |ui| font_menu(ui, FontTarget::One(file), current));
-            }
-        });
-
-        kit::group(ui, kit, "Nerd Fonts", |g| {
-            g.custom(|ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Fonts patched with thousands of icons, which roobar uses for its glyphs. Click one to download it from github.com/ryanoasis/nerd-fonts and install it just for you (no admin).")
-                            .size(12.0)
-                            .color(kit.sub),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    for nf in NERD_FONTS {
-                        if busy == Some(nf.family) {
-                            ui.add(egui::Spinner::new().size(14.0));
-                            kit::chip(ui, kit, &format!("Installing {}…", nf.family), kit.sub);
-                        } else if is_installed(nf.family) {
-                            kit::chip(ui, kit, &format!("✓ {}", nf.family), Color32::from_rgb(52, 199, 89));
-                        } else if kit::button(ui, kit, &format!("⬇ {}", nf.family), false).clicked() {
-                            download = Some(FontRequest { font: *nf, target: FontTarget::InstallOnly });
-                        }
-                    }
-                });
-            });
-        });
-
-        if let Some((target, family)) = picked {
-            self.apply_font_choice(target, &family);
-        }
-        if download.is_some() {
-            self.font_confirm = download;
-        }
-
-        // "Download this font?" confirmation.
-        if let Some(req) = self.font_confirm {
-            let mut answer = None;
-            egui::Modal::new(egui::Id::new("font-download-confirm")).show(&ctx, |ui| {
-                ui.set_width(380.0);
-                ui.label(RichText::new(format!("Download {}?", req.font.family)).size(16.0).color(kit.fg));
-                ui.add_space(6.0);
-                let then = match req.target {
-                    FontTarget::One(file) => format!(" Then it's used for {}.", FONT_TARGETS.iter().find(|(f, _)| *f == file).map_or(file, |(_, l)| l)),
-                    FontTarget::All => " Then it's used everywhere.".to_string(),
-                    FontTarget::InstallOnly => String::new(),
-                };
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "It's downloaded from the official Nerd Fonts release on GitHub and installed for your user only, in your local font folder. No administrator rights needed.{then}"
-                        ))
-                        .size(12.0)
-                        .color(kit.sub),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if kit::button(ui, kit, "Download & install", true).clicked() {
-                        answer = Some(true);
-                    }
-                    if kit::button(ui, kit, "Cancel", false).clicked() {
-                        answer = Some(false);
-                    }
-                });
-            });
-            match answer {
-                Some(true) => {
-                    self.font_confirm = None;
-                    self.start_font_job(req, &ctx);
-                }
-                Some(false) => self.font_confirm = None,
-                None => {}
-            }
-        }
-    }
-
-    fn apply_font_choice(&mut self, target: FontTarget, family: &str) {
-        use chickenwm_core::fonts::{set_css_font, FONT_TARGETS};
-        let files: Vec<&str> = match target {
-            FontTarget::One(file) => vec![file],
-            // Only the stylesheets that exist (browser.css appears once the browser has run).
-            FontTarget::All => FONT_TARGETS
-                .iter()
-                .map(|(f, _)| *f)
-                .filter(|f| chickenwm_core::config::config_dir().join(f).exists())
-                .collect(),
-            FontTarget::InstallOnly => return,
-        };
-        self.current_fonts = None;
-        let failed: Vec<String> = files
-            .iter()
-            .filter_map(|f| set_css_font(f, family).err().map(|e| format!("{f}: {e}")))
-            .collect();
-        self.status_banner = if failed.is_empty() {
-            format!("Font set to {family}")
-        } else {
-            format!("Couldn't set the font for {}", failed.join(", "))
-        };
-    }
-
-    fn start_font_job(&mut self, request: FontRequest, ctx: &egui::Context) {
-        if self.font_job.is_some() {
-            self.status_banner = "Another font is still installing".to_string();
-            return;
-        }
-        let job = Arc::new(std::sync::Mutex::new(FontJob { request, result: None }));
-        self.font_job = Some(Arc::clone(&job));
-        self.status_banner = format!("Downloading {}…", request.font.family);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = chickenwm_core::fonts::install_nerd_font(&request.font).map_err(|e| format!("{e:#}"));
-            if let Ok(mut j) = job.lock() {
-                j.result = Some(result);
-            }
-            ctx.request_repaint();
-        });
-    }
-
-    /// Picks up a finished download: refreshes the font list and applies the font if a module
-    /// was waiting for it.
-    fn poll_font_job(&mut self) {
-        let Some(job) = &self.font_job else { return };
-        let finished = job.lock().ok().and_then(|mut j| j.result.take().map(|r| (j.request, r)));
-        let Some((request, result)) = finished else { return };
-        self.font_job = None;
-        match result {
-            Ok(n) => {
-                self.installed_fonts = Some(chickenwm_core::fonts::installed_families(true));
-                self.status_banner = format!("Installed {} ({n} files)", request.font.family);
-                if request.target != FontTarget::InstallOnly {
-                    self.apply_font_choice(request.target, request.font.family);
-                }
-            }
-            Err(e) => self.status_banner = format!("Couldn't install {}: {e}", request.font.family),
-        }
-    }
-
     fn sidebar(&mut self, ui: &mut egui::Ui, kit: &Kit) {
         ui.add_space(10.0);
-        kit::search_field(ui, kit, &mut self.search, "Search");
+        let search_resp = kit::search_field(ui, kit, &mut self.search, "Search");
         ui.add_space(12.0);
         let q = self.search.trim().to_ascii_lowercase();
         let mut shown = 0;
         for p in &PAGES {
-            if !q.is_empty() && !p.title.to_ascii_lowercase().contains(&q) && !p.keywords.contains(&q) {
+            if !q.is_empty()
+                && !p.title.to_ascii_lowercase().contains(&q)
+                && !p.keywords.contains(&q)
+            {
                 continue;
             }
             shown += 1;
@@ -1355,14 +592,156 @@ impl SettingsApp {
             }
             ui.add_space(2.0);
         }
-        if shown == 0 {
+
+        // Individual settings that match, across every page.
+        let mut settings_hits = 0;
+        if !q.is_empty() {
+            let hits: Vec<(Page, String)> = self
+                .search_index
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|(_, label, hint)| {
+                    label.to_lowercase().contains(&q) || hint.to_lowercase().contains(&q)
+                })
+                .take(14)
+                .map(|(p, l, _)| (*p, l.clone()))
+                .collect();
+
+            // Automatically jump to and highlight the top matching control as the user searches or presses Enter.
+            if let Some((first_page, first_label)) = hits.first() {
+                let enter_pressed =
+                    search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if self.last_search_jumped != q || enter_pressed {
+                    self.last_search_jumped = q.clone();
+                    self.page = *first_page;
+                    kit::highlight_row(first_label);
+                }
+            }
+
+            if !hits.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("SETTINGS").size(11.0).color(kit.sub));
+                ui.add_space(4.0);
+            }
+            for (page, label) in hits {
+                settings_hits += 1;
+                let text = format!("{label}\n{}", info(page).title);
+                let resp = ui.add(
+                    egui::Button::new(RichText::new(text).size(12.5))
+                        .frame(false)
+                        .wrap(),
+                );
+                if resp.clicked() {
+                    self.page = page;
+                    kit::highlight_row(&label);
+                }
+            }
+        } else {
+            self.last_search_jumped.clear();
+        }
+
+        // Unsaved changes diff preview.
+        let unsaved = self.unsaved_diff();
+        if !unsaved.is_empty() {
+            ui.add_space(12.0);
+            let label = format!("Unsaved diff ({})", unsaved.len());
+            if kit::button(ui, kit, &label, self.show_unsaved_diff).clicked() {
+                self.show_unsaved_diff = !self.show_unsaved_diff;
+            }
+            if self.show_unsaved_diff {
+                ui.add_space(4.0);
+                egui::Frame::NONE
+                    .fill(kit.card)
+                    .stroke(Stroke::new(1.0_f32, kit.border))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        for line in unsaved.iter().take(12) {
+                            let color = if line.starts_with('-') || line.contains(" - ") {
+                                kit.danger
+                            } else {
+                                Color32::from_rgb(52, 199, 89)
+                            };
+                            ui.label(RichText::new(line).monospace().size(10.5).color(color));
+                        }
+                    });
+            }
+        }
+
+        // Multi-step Undo history.
+        if !self.undo.is_empty() {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if kit::button(ui, kit, "Undo", false)
+                    .on_hover_text("Ctrl+Z")
+                    .clicked()
+                {
+                    self.undo_last_change();
+                }
+                let hist_label = format!("History ({})", self.undo.len());
+                if kit::button(ui, kit, &hist_label, self.show_undo_history).clicked() {
+                    self.show_undo_history = !self.show_undo_history;
+                }
+            });
+            if self.show_undo_history {
+                ui.add_space(4.0);
+                let mut revert_to = None;
+                let entries: Vec<(usize, String, usize)> = self
+                    .undo
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, e)| (i, e.label.clone(), e.diff.len()))
+                    .collect();
+                for (idx, label, diff_len) in entries {
+                    let row_text = format!("#{} {label} ({diff_len}Δ)", idx + 1);
+                    if ui
+                        .small_button(RichText::new(row_text).size(11.5).color(kit.fg))
+                        .on_hover_text("Click to revert back to before this step")
+                        .clicked()
+                    {
+                        revert_to = Some(idx);
+                    }
+                }
+                if let Some(idx) = revert_to {
+                    self.undo_to_step(idx);
+                }
+            }
+        }
+
+        if shown == 0 && settings_hits == 0 {
             ui.add_space(8.0);
             ui.label(RichText::new("No results").color(kit.sub));
-        } else if shown == 1 && !q.is_empty() {
-            // A single match opens it right away.
-            if let Some(p) = PAGES.iter().find(|p| p.title.to_ascii_lowercase().contains(&q) || p.keywords.contains(&q)) {
+        } else if shown == 1 && settings_hits == 0 && !q.is_empty() {
+            if let Some(p) = PAGES
+                .iter()
+                .find(|p| p.title.to_ascii_lowercase().contains(&q) || p.keywords.contains(&q))
+            {
                 self.page = p.page;
             }
+        }
+    }
+
+    fn draw_page(
+        &mut self,
+        page: Page,
+        ui: &mut egui::Ui,
+        kit: &Kit,
+        dt: f32,
+        ctx: &egui::Context,
+    ) {
+        match page {
+            Page::General => self.page_general(ui, kit),
+            Page::Appearance => self.page_appearance(ui, kit),
+            Page::Wallpaper => self.page_wallpaper(ui, kit),
+            Page::Displays => self.page_displays(ui, kit),
+            Page::Tiling => self.page_tiling(ui, kit),
+            Page::Animations => self.page_animations(ui, kit, dt),
+            Page::Keyboard => self.page_keyboard(ui, kit, ctx),
+            Page::WindowRules => self.page_window_rules(ui, kit),
+            Page::Fonts => self.page_fonts(ui, kit),
+            Page::Logs => self.page_logs(ui, kit),
         }
     }
 
@@ -1379,14 +758,29 @@ impl SettingsApp {
         }
         ctx.request_repaint();
         let a = (age / 0.15).min(1.0) * ((2.6 - age) / 0.4).min(1.0);
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("status-toast")));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("status-toast"),
+        ));
         let font = egui::FontId::proportional(13.0);
-        let galley = painter.layout_no_wrap(self.status_banner.clone(), font, kit.accent_fg.gamma_multiply(a));
+        let galley =
+            painter.layout_no_wrap(self.status_banner.clone(), font, kit.accent_fg.gamma_multiply(a));
         let size = galley.size() + Vec2::new(28.0, 14.0);
-        let rect = egui::Rect::from_center_size(egui::pos2(area.center().x, area.bottom() - 30.0 + (1.0 - a) * 8.0), size);
-        painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), CornerRadius::same(255), Color32::from_black_alpha((40.0 * a) as u8));
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(area.center().x, area.bottom() - 30.0 + (1.0 - a) * 8.0),
+            size,
+        );
+        painter.rect_filled(
+            rect.translate(Vec2::new(0.0, 2.0)),
+            CornerRadius::same(255),
+            Color32::from_black_alpha((40.0 * a) as u8),
+        );
         painter.rect_filled(rect, CornerRadius::same(255), kit.accent.gamma_multiply(a));
-        painter.galley(rect.min + Vec2::new(14.0, 7.0), galley, kit.accent_fg.gamma_multiply(a));
+        painter.galley(
+            rect.min + Vec2::new(14.0, 7.0),
+            galley,
+            kit.accent_fg.gamma_multiply(a),
+        );
     }
 }
 
@@ -1407,42 +801,68 @@ impl eframe::App for SettingsApp {
             self.visuals_from = Some(sheet);
         }
 
+        kit::set_config_issues(&self.config_issues);
+
         egui::SidePanel::left("settings_sidebar")
             .resizable(false)
             .exact_width(236.0)
-            .frame(egui::Frame::NONE.fill(kit.sidebar).inner_margin(egui::Margin::symmetric(10, 6)).stroke(Stroke::new(1.0_f32, kit.border)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(kit.sidebar)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .stroke(Stroke::new(1.0_f32, kit.border)),
+            )
             .show(ctx, |ui| self.sidebar(ui, &kit));
 
-        let central = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(kit.bg)).show(ctx, |ui| {
-            let page = info(self.page);
-            egui::ScrollArea::vertical().id_salt(("page", self.page as u8)).auto_shrink([false, false]).show(ui, |ui| {
-                // A centered content column, like macOS.
-                let width = ui.available_width();
-                let column = width.min(700.0) - 48.0;
-                let side = ((width - column) / 2.0).max(24.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(side);
-                    ui.vertical(|ui| {
-                        ui.set_width(column);
-                        ui.add_space(22.0);
-                        kit::page_title(ui, &kit, page.title, page.subtitle);
-                        match self.page {
-                            Page::General => self.page_general(ui, &kit),
-                            Page::Appearance => self.page_appearance(ui, &kit),
-                            Page::Wallpaper => self.page_wallpaper(ui, &kit),
-                            Page::Displays => self.page_displays(ui, &kit),
-                            Page::Tiling => self.page_tiling(ui, &kit),
-                            Page::Animations => self.page_animations(ui, &kit, dt),
-                            Page::Keyboard => self.page_keyboard(ui, &kit, ctx),
-                            Page::WindowRules => self.page_window_rules(ui, &kit),
-                            Page::Fonts => self.page_fonts(ui, &kit),
-                        }
-                        ui.add_space(30.0);
+        // Ctrl+Z (when no text field has the keyboard): undo the last saved change.
+        if !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z))
+        {
+            self.undo_last_change();
+        }
+
+        let central = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(kit.bg))
+            .show(ctx, |ui| {
+                // First frame: draw every page once, invisibly, to learn its settings for search.
+                if self.search_index.is_none() {
+                    let current = self.page;
+                    let mut index = Vec::new();
+                    for p in PAGES.iter().map(|p| p.page) {
+                        let mut hidden = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(("search-index", p as u8))
+                                .invisible(),
+                        );
+                        let rows =
+                            kit::collect_rows(|| self.draw_page(p, &mut hidden, &kit, 0.0, ctx));
+                        index.extend(rows.into_iter().map(|(label, hint)| (p, label, hint)));
+                    }
+                    self.page = current;
+                    self.search_index = Some(index);
+                }
+                let page = info(self.page);
+                egui::ScrollArea::vertical()
+                    .id_salt(("page", self.page as u8))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let width = ui.available_width();
+                        let column = width.min(700.0) - 48.0;
+                        let side = ((width - column) / 2.0).max(24.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(side);
+                            ui.vertical(|ui| {
+                                ui.set_width(column);
+                                ui.add_space(22.0);
+                                kit::page_title(ui, &kit, page.title, page.subtitle);
+                                self.draw_page(self.page, ui, &kit, dt, ctx);
+                                ui.add_space(30.0);
+                            });
+                        });
                     });
-                });
             });
-        });
-        self.status_toast(ctx, &kit, central.response.rect);    }
+        self.status_toast(ctx, &kit, central.response.rect);
+    }
 }
 
 fn main() -> Result<()> {
@@ -1450,7 +870,9 @@ fn main() -> Result<()> {
     let _failsafe = spawn_emergency_failsafe_thread();
 
     let (doc, cfg) = bootstrap_config_and_themes()?;
-    let css = Arc::new(RwLock::new(load_css_sheet("settings.css").unwrap_or_default()));
+    let css = Arc::new(RwLock::new(
+        load_css_sheet("settings.css").unwrap_or_default(),
+    ));
     let css_watcher_ref = Arc::clone(&css);
     let _watcher = spawn_config_watcher(move |ev| {
         if let ConfigWatchEvent::CssChanged { file_name, .. } = ev {
@@ -1462,7 +884,15 @@ fn main() -> Result<()> {
         }
     });
 
+    // `--render-to out.png [--page <name>]`: one frame, headless.
+    if let Some(req) = chickenwm_core::headless::RenderRequest::from_args([960.0, 680.0]) {
+        return chickenwm_core::headless::render_app(&req, |_cc| SettingsApp::new(doc, cfg, css));
+    }
+
     let native_options = eframe::NativeOptions {
+        // glow, not wgpu: egui_kittest (headless feature) also enables eframe's wgpu backend,
+        // which eframe would then prefer, and wgpu draws transparent windows black on Windows.
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("Settings")
             .with_inner_size([960.0, 680.0])
@@ -1477,4 +907,70 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chickenwm_core::config::DEFAULT_CHICKENWM_CONF;
+
+    #[test]
+    fn compute_line_diff_detects_modified_lines() {
+        let a = "general {\n    gaps_in = 5\n    gaps_out = 10\n}\n";
+        let b = "general {\n    gaps_in = 12\n    gaps_out = 10\n}\n";
+        let diff = compute_line_diff(a, b);
+        assert_eq!(
+            diff,
+            vec!["- L2:     gaps_in = 5", "+ L2:     gaps_in = 12"]
+        );
+    }
+
+    #[test]
+    fn inline_config_issues_map_to_control_labels_with_line_numbers() {
+        let src = "general {\n    gaps_in = bad_num\n    border_size = thick\n}\n";
+        let issues = chickenwm_core::config_check::validate(src);
+        kit::set_config_issues(&issues);
+
+        let gap_issues = kit::inline_issues_for_row("Gaps between windows");
+        assert_eq!(gap_issues.len(), 1);
+        assert_eq!(gap_issues[0].line, 2);
+
+        let border_issues = kit::inline_issues_for_row("Border width");
+        assert_eq!(border_issues.len(), 1);
+        assert_eq!(border_issues[0].line, 3);
+    }
+
+    #[test]
+    fn window_rules_builder_combines_multiple_matchers() {
+        let m = pages::window_rules::build_combined_matcher(
+            "Spotify",
+            "",
+            "Spotify.*",
+            "spotify.exe",
+        );
+        assert_eq!(
+            m,
+            "class:^(Spotify)$ initialTitle:Spotify.* process:^(spotify.exe)$"
+        );
+    }
+
+    #[test]
+    fn headless_render_captures_settings_screenshot_from_parsed_config() {
+        let doc = ConfigDocument::parse(DEFAULT_CHICKENWM_CONF).unwrap();
+        let cfg = doc.compile();
+        let css = Arc::new(RwLock::new(CssStyleSheet::default()));
+        let out_path = std::env::temp_dir().join("chickenwm_settings_headless_test.png");
+        let _ = std::fs::remove_file(&out_path);
+        let req = chickenwm_core::headless::RenderRequest {
+            out: out_path.clone(),
+            size: egui::vec2(960.0, 680.0),
+            pixels_per_point: 1.0,
+            frames: 2,
+        };
+        chickenwm_core::headless::render_app(&req, |_cc| SettingsApp::new(doc, cfg, css))
+            .expect("headless screenshot render should succeed");
+        let meta = std::fs::metadata(&out_path).expect("screenshot file written");
+        assert!(meta.len() > 1000);
+        let _ = std::fs::remove_file(&out_path);
+    }
 }

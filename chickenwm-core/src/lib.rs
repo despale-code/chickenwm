@@ -9,19 +9,25 @@
 //! - Safe RAII Win32 handle wrappers (`handles`)
 
 pub mod config;
+pub mod config_check;
 pub mod css;
 pub mod elevation;
 pub mod failsafe;
 pub mod fonts;
 pub mod frame_scheduler;
+#[cfg(feature = "headless")]
+pub mod headless;
 pub mod handles;
 pub mod icon_theme;
 pub mod instance;
 pub mod ipc;
 pub mod monitor;
+pub mod scoring;
 pub mod theme;
 pub mod theme_presets;
+pub mod theme_tools;
 pub mod wallpaper;
+pub mod window_rules;
 
 use anyhow::Result;
 

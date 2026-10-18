@@ -21,7 +21,12 @@ crossbeam-channel.workspace = true
 windows.workspace = true
 image.workspace = true
 zip.workspace = true
+regex = "1"
 egui = { workspace = true, optional = true }
+eframe = { workspace = true, optional = true }
+egui_kittest = { version = "0.31", optional = true, features = ["wgpu", "eframe"] }
 
 [features]
 egui = ["dep:egui"]
+# `--render-to <png>`: run an egui app headless and save one frame (no window, no focus).
+headless = ["egui", "dep:eframe", "dep:egui_kittest"]

@@ -38,6 +38,9 @@ pub enum AstNode {
         name: String,
         raw_value: String,
         trailing_comment: Option<String>,
+        /// The line exactly as written, until this node is edited (keeps the user's spacing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
     /// Top-level directive (`bind = ...`, `monitor = ...`, `exec-once = ...`, `windowrulev2 = ...`, `bezier = ...`, `animation = ...`).
     Directive {
@@ -45,6 +48,8 @@ pub enum AstNode {
         keyword: String,
         raw_value: String,
         trailing_comment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
     /// Key-value assignment inside a category block (`gaps_in = 5`).
     KeyValue {
@@ -52,6 +57,8 @@ pub enum AstNode {
         key: String,
         raw_value: String,
         trailing_comment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
     },
     /// Nested category block (`general { ... }`, `misc { ... }`, etc.).
     Category {
@@ -61,6 +68,11 @@ pub enum AstNode {
         children: Vec<AstNode>,
         footer_indent: String,
         footer_comment: Option<String>,
+        /// The `name {` and `}` lines as written (`Some("")` footer: the file never closed it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_header: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_footer: Option<String>,
     },
 }
 
@@ -196,6 +208,7 @@ fn is_top_level_directive(key: &str) -> bool {
             | "binde"
             | "bindm"
             | "bindl"
+            | "submap"
             | "windowrule"
             | "windowrulev2"
             | "wallpaper"
@@ -208,7 +221,8 @@ impl ConfigDocument {
     /// Parses a `chickenwm.conf` string into a lossless `ConfigDocument` AST using `winnow`.
     pub fn parse(source: &str) -> Result<Self> {
         let mut root_nodes = Vec::new();
-        let mut category_stack: Vec<(String, String, Option<String>, Vec<AstNode>)> = Vec::new();
+        // (indent, name, header comment, children, header line as written)
+        let mut category_stack: Vec<(String, String, Option<String>, Vec<AstNode>, String)> = Vec::new();
 
         for raw_line in source.lines() {
             let mut slice = raw_line;
@@ -216,11 +230,12 @@ impl ConfigDocument {
                 .map_err(|e| anyhow::anyhow!("Failed to parse config line '{raw_line}': {e}"))?;
 
             let in_root_scope = category_stack.is_empty();
-            let target_vec = if let Some((_, _, _, children)) = category_stack.last_mut() {
+            let target_vec = if let Some((_, _, _, children, _)) = category_stack.last_mut() {
                 children
             } else {
                 &mut root_nodes
             };
+            let raw = Some(raw_line.to_string());
 
             match parsed {
                 ParsedLine::Blank(raw) => target_vec.push(AstNode::Blank { raw }),
@@ -230,14 +245,14 @@ impl ConfigDocument {
                     name,
                     comment,
                 } => {
-                    category_stack.push((indent, name, comment, Vec::new()));
+                    category_stack.push((indent, name, comment, Vec::new(), raw_line.to_string()));
                 }
                 ParsedLine::CategoryEnd { indent, comment } => {
-                    if let Some((cat_indent, cat_name, header_comment, children)) =
+                    if let Some((cat_indent, cat_name, header_comment, children, header_raw)) =
                         category_stack.pop()
                     {
                         let parent_vec =
-                            if let Some((_, _, _, parent_children)) = category_stack.last_mut() {
+                            if let Some((_, _, _, parent_children, _)) = category_stack.last_mut() {
                                 parent_children
                             } else {
                                 &mut root_nodes
@@ -249,7 +264,12 @@ impl ConfigDocument {
                             children,
                             footer_indent: indent,
                             footer_comment: comment,
+                            raw_header: Some(header_raw),
+                            raw_footer: raw,
                         });
+                    } else {
+                        // A `}` with nothing open (so we're at the root): keep the line.
+                        root_nodes.push(AstNode::Comment { raw: raw_line.to_string() });
                     }
                 }
                 ParsedLine::Assignment {
@@ -264,6 +284,7 @@ impl ConfigDocument {
                             name: var_name.trim().to_string(),
                             raw_value: rhs,
                             trailing_comment: comment,
+                            raw,
                         });
                     } else if in_root_scope && is_top_level_directive(&lhs) {
                         target_vec.push(AstNode::Directive {
@@ -271,6 +292,7 @@ impl ConfigDocument {
                             keyword: lhs,
                             raw_value: rhs,
                             trailing_comment: comment,
+                            raw,
                         });
                     } else {
                         target_vec.push(AstNode::KeyValue {
@@ -278,15 +300,16 @@ impl ConfigDocument {
                             key: lhs,
                             raw_value: rhs,
                             trailing_comment: comment,
+                            raw,
                         });
                     }
                 }
             }
         }
 
-        // Close any unclosed categories gracefully
-        while let Some((cat_indent, cat_name, header_comment, children)) = category_stack.pop() {
-            let parent_vec = if let Some((_, _, _, parent_children)) = category_stack.last_mut() {
+        // Close any unclosed categories gracefully (and write them back unclosed, as found).
+        while let Some((cat_indent, cat_name, header_comment, children, header_raw)) = category_stack.pop() {
+            let parent_vec = if let Some((_, _, _, parent_children, _)) = category_stack.last_mut() {
                 parent_children
             } else {
                 &mut root_nodes
@@ -298,6 +321,8 @@ impl ConfigDocument {
                 children,
                 footer_indent: String::new(),
                 footer_comment: None,
+                raw_header: Some(header_raw),
+                raw_footer: Some(String::new()),
             });
         }
 
@@ -313,89 +338,69 @@ impl ConfigDocument {
     }
 
     fn serialize_nodes(nodes: &[AstNode], out: &mut String) {
+        // `key = value # comment`, rebuilt (only for lines that were edited or are new).
+        let assignment = |out: &mut String, indent: &str, lhs: &str, value: &str, comment: &Option<String>| {
+            out.push_str(indent);
+            out.push_str(lhs);
+            out.push_str(" = ");
+            out.push_str(value);
+            if let Some(c) = comment {
+                out.push(' ');
+                out.push_str(c);
+            }
+            out.push('\n');
+        };
         for node in nodes {
             match node {
-                AstNode::Blank { raw } => {
+                AstNode::Blank { raw } | AstNode::Comment { raw } => {
                     out.push_str(raw);
                     out.push('\n');
                 }
-                AstNode::Comment { raw } => {
+                AstNode::Variable { raw: Some(raw), .. } | AstNode::Directive { raw: Some(raw), .. } | AstNode::KeyValue { raw: Some(raw), .. } => {
                     out.push_str(raw);
                     out.push('\n');
                 }
-                AstNode::Variable {
-                    indent,
-                    name,
-                    raw_value,
-                    trailing_comment,
-                } => {
-                    out.push_str(indent);
-                    out.push('$');
-                    out.push_str(name);
-                    out.push_str(" = ");
-                    out.push_str(raw_value);
-                    if let Some(c) = trailing_comment {
-                        out.push(' ');
-                        out.push_str(c);
-                    }
-                    out.push('\n');
+                AstNode::Variable { indent, name, raw_value, trailing_comment, raw: None } => {
+                    assignment(out, indent, &format!("${name}"), raw_value, trailing_comment);
                 }
-                AstNode::Directive {
-                    indent,
-                    keyword,
-                    raw_value,
-                    trailing_comment,
-                } => {
-                    out.push_str(indent);
-                    out.push_str(keyword);
-                    out.push_str(" = ");
-                    out.push_str(raw_value);
-                    if let Some(c) = trailing_comment {
-                        out.push(' ');
-                        out.push_str(c);
-                    }
-                    out.push('\n');
+                AstNode::Directive { indent, keyword, raw_value, trailing_comment, raw: None } => {
+                    assignment(out, indent, keyword, raw_value, trailing_comment);
                 }
-                AstNode::KeyValue {
-                    indent,
-                    key,
-                    raw_value,
-                    trailing_comment,
-                } => {
-                    out.push_str(indent);
-                    out.push_str(key);
-                    out.push_str(" = ");
-                    out.push_str(raw_value);
-                    if let Some(c) = trailing_comment {
-                        out.push(' ');
-                        out.push_str(c);
-                    }
-                    out.push('\n');
+                AstNode::KeyValue { indent, key, raw_value, trailing_comment, raw: None } => {
+                    assignment(out, indent, key, raw_value, trailing_comment);
                 }
-                AstNode::Category {
-                    indent,
-                    name,
-                    header_comment,
-                    children,
-                    footer_indent,
-                    footer_comment,
-                } => {
-                    out.push_str(indent);
-                    out.push_str(name);
-                    out.push_str(" {");
-                    if let Some(hc) = header_comment {
-                        out.push(' ');
-                        out.push_str(hc);
+                AstNode::Category { indent, name, header_comment, children, footer_indent, footer_comment, raw_header, raw_footer } => {
+                    match raw_header {
+                        Some(raw) => out.push_str(raw),
+                        None => {
+                            out.push_str(indent);
+                            out.push_str(name);
+                            out.push_str(" {");
+                            if let Some(hc) = header_comment {
+                                out.push(' ');
+                                out.push_str(hc);
+                            }
+                        }
                     }
                     out.push('\n');
                     Self::serialize_nodes(children, out);
-                    out.push_str(footer_indent);
-                    out.push('}');
-                    if let Some(fc) = footer_comment {
-                        out.push(' ');
-                        out.push_str(fc);
+                    match raw_footer {
+                        // The file never closed this section: leave it that way.
+                        Some(raw) if raw.is_empty() => {}
+                        Some(raw) => {
+                            out.push_str(raw);
+                            out.push('\n');
+                        }
+                        None => {
+                            out.push_str(footer_indent);
+                            out.push('}');
+                            if let Some(fc) = footer_comment {
+                                out.push(' ');
+                                out.push_str(fc);
+                            }
+                            out.push('\n');
+                        }
                     }
-                    out.push('\n');
                 }
             }
         }
@@ -409,11 +414,14 @@ impl ConfigDocument {
                 if name.eq_ignore_ascii_case(category) {
                     for child in children.iter_mut() {
                         if let AstNode::KeyValue {
-                            key: k, raw_value, ..
+                            key: k, raw_value, raw, ..
                         } = child
                         {
                             if k.eq_ignore_ascii_case(key) {
-                                *raw_value = value.to_string();
+                                if raw_value != value {
+                                    *raw_value = value.to_string();
+                                    *raw = None;
+                                }
                                 return;
                             }
                         }
@@ -423,6 +431,7 @@ impl ConfigDocument {
                         key: key.to_string(),
                         raw_value: value.to_string(),
                         trailing_comment: None,
+                        raw: None,
                     });
                     return;
                 }
@@ -440,9 +449,12 @@ impl ConfigDocument {
                 key: key.to_string(),
                 raw_value: value.to_string(),
                 trailing_comment: None,
+                raw: None,
             }],
             footer_indent: String::new(),
             footer_comment: None,
+            raw_header: None,
+            raw_footer: None,
         });
     }
 
@@ -451,11 +463,14 @@ impl ConfigDocument {
         let clean = var_name.trim_start_matches('$');
         for node in &mut self.nodes {
             if let AstNode::Variable {
-                name, raw_value, ..
+                name, raw_value, raw, ..
             } = node
             {
                 if name == clean {
-                    *raw_value = value.to_string();
+                    if raw_value != value {
+                        *raw_value = value.to_string();
+                        *raw = None;
+                    }
                     return;
                 }
             }
@@ -467,6 +482,7 @@ impl ConfigDocument {
                 name: clean.to_string(),
                 raw_value: value.to_string(),
                 trailing_comment: None,
+                raw: None,
             },
         );
     }
@@ -479,6 +495,7 @@ impl ConfigDocument {
             keyword: keyword.to_string(),
             raw_value: value.to_string(),
             trailing_comment: None,
+            raw: None,
         });
     }
 
@@ -861,7 +878,7 @@ pub struct MiscConfig {
 }
 
 fn default_resize_preview_classes() -> Vec<String> {
-    vec!["MozillaWindowClass".to_string()]
+    Vec::new()
 }
 
 impl Default for MiscConfig {
@@ -882,7 +899,12 @@ impl Default for MiscConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputConfig {
     pub kb_layout: String,
+    /// 0 = hovering never focuses, 1 = hovering a tile focuses it.
     pub follow_mouse: u8,
+    /// How long the cursor must rest over a tile before it takes focus (0 = at once).
+    pub hover_delay_ms: u32,
+    /// After a key press, hover focus stays off this long so a bumped mouse can't steal focus.
+    pub keyboard_grace_ms: u32,
     pub sensitivity: f32,
     pub repeat_rate: u32,
     pub repeat_delay: u32,
@@ -893,6 +915,8 @@ impl Default for InputConfig {
         Self {
             kb_layout: "us".to_string(),
             follow_mouse: 1,
+            hover_delay_ms: 0,
+            keyboard_grace_ms: 400,
             sensitivity: 0.0,
             repeat_rate: 30,
             repeat_delay: 300,
@@ -984,6 +1008,9 @@ pub struct BindRule {
     pub key: String,
     pub dispatcher: String,
     pub arg: String,
+    /// Optional modal layer (`""` = global layer, `"resize"` = active in `submap = resize`).
+    #[serde(default)]
+    pub submap: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1023,13 +1050,26 @@ pub struct HyprConfig {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub paper: PaperConfig,
+    #[serde(skip)]
+    pub current_submap: String,
 }
 
 /// The `paper { }` block: wallpaper layers composited bottom to top by `chickenwm-paper`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PaperConfig {
     pub layers: Vec<PaperLayer>,
+    /// Pause animated shader layers when running on battery power (`true` by default).
+    pub pause_on_battery: bool,
+}
+
+impl Default for PaperConfig {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            pause_on_battery: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1069,6 +1109,10 @@ pub struct PaperLayer {
     pub softness: f32,
     /// Removes the key color's tint from the edges that remain (green fringes).
     pub despill: bool,
+    /// Optional monitor filter (e.g. `\\.\DISPLAY1` or `DISPLAY1`). `None` = all monitors.
+    pub monitor: Option<String>,
+    /// Optional workspace filter (`1..=10`). `None` = all workspaces.
+    pub workspace: Option<u32>,
 }
 
 impl Default for PaperLayer {
@@ -1086,6 +1130,8 @@ impl Default for PaperLayer {
             tolerance: 0.2,
             softness: 0.1,
             despill: true,
+            monitor: None,
+            workspace: None,
         }
     }
 }
@@ -1113,6 +1159,23 @@ fn split_top_level(v: &str) -> Vec<String> {
 }
 
 impl PaperLayer {
+    /// Whether this layer applies to `monitor_name` and `workspace_id`.
+    pub fn matches_context(&self, monitor_name: &str, workspace_id: u32) -> bool {
+        if let Some(ws) = self.workspace {
+            if ws != workspace_id {
+                return false;
+            }
+        }
+        if let Some(ref mon) = self.monitor {
+            let m_clean = mon.trim().trim_start_matches(r"\\.\");
+            let cur_clean = monitor_name.trim().trim_start_matches(r"\\.\");
+            if !m_clean.is_empty() && !m_clean.eq_ignore_ascii_case(cur_clean) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Parses the value of a `layer =` line: `image, ~/bg/char.png, key = rgb(00ff00), opacity = 0.8`.
     pub fn parse(v: &str) -> Option<Self> {
         let parts = split_top_level(v);
@@ -1146,6 +1209,18 @@ impl PaperLayer {
                 "softness" | "smoothness" | "feather" => layer.softness = num().unwrap_or(0.1).clamp(0.0, 1.0),
                 "despill" | "spill" => layer.despill = parse_bool(val).unwrap_or(true),
                 "source" | "path" | "file" => layer.source = val.to_string(),
+                "monitor" | "display" => {
+                    if !val.is_empty() {
+                        layer.monitor = Some(val.to_string());
+                    }
+                }
+                "workspace" | "ws" => {
+                    if let Ok(ws) = val.parse::<u32>() {
+                        if (1..=10).contains(&ws) {
+                            layer.workspace = Some(ws);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1174,6 +1249,10 @@ pub struct NotificationsConfig {
     pub windows_toasts: bool,
     /// Apps (display names, case-insensitive) whose notifications are dropped.
     pub blocked: Vec<String>,
+    /// Optional quiet-hours schedule (`22:00-07:00`) during which Do Not Disturb is active automatically.
+    pub quiet_hours: String,
+    /// Apps (display names, case-insensitive) allowed to pop up even when Do Not Disturb / quiet hours is active.
+    pub dnd_exceptions: Vec<String>,
 }
 
 impl Default for NotificationsConfig {
@@ -1187,6 +1266,8 @@ impl Default for NotificationsConfig {
             margin_y: 12,
             windows_toasts: true,
             blocked: Vec::new(),
+            quiet_hours: String::new(),
+            dnd_exceptions: Vec::new(),
         }
     }
 }
@@ -1386,13 +1467,19 @@ impl HyprConfig {
                 }
                 _ => {}
             },
-            "paper" => {
-                if k == "layer" {
+            "paper" => match k.as_str() {
+                "layer" => {
                     if let Some(layer) = PaperLayer::parse(v) {
                         self.paper.layers.push(layer);
                     }
                 }
-            }
+                "pause_on_battery" => {
+                    if let Some(b) = parse_bool(v) {
+                        self.paper.pause_on_battery = b;
+                    }
+                }
+                _ => {}
+            },
             "notifications" => match k.as_str() {
                 "enabled" => {
                     if let Some(b) = parse_bool(v) {
@@ -1432,6 +1519,16 @@ impl HyprConfig {
                         .filter(|a| !a.is_empty())
                         .collect();
                 }
+                "quiet_hours" | "dnd_schedule" => {
+                    self.notifications.quiet_hours = v.trim().to_string();
+                }
+                "dnd_exceptions" | "dnd_allow" => {
+                    self.notifications.dnd_exceptions = v
+                        .split(',')
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty())
+                        .collect();
+                }
                 _ => {}
             },
             "theme" => match k.as_str() {
@@ -1455,6 +1552,16 @@ impl HyprConfig {
                     };
                 }
                 "app_modes" => self.theme.app_modes = crate::theme::ThemeConfig::parse_app_modes(v),
+                "auto_dark" => self.theme.auto_dark.mode = v.trim().to_ascii_lowercase(),
+                "light_at" => self.theme.auto_dark.light_at = v.trim().to_string(),
+                "dark_at" => self.theme.auto_dark.dark_at = v.trim().to_string(),
+                "location" => {
+                    let mut it = v.split(',').map(|s| s.trim().parse::<f64>());
+                    if let (Some(Ok(lat)), Some(Ok(lon))) = (it.next(), it.next()) {
+                        self.theme.auto_dark.latitude = Some(lat);
+                        self.theme.auto_dark.longitude = Some(lon);
+                    }
+                }
                 _ => {}
             },
             "misc" => match k.as_str() {
@@ -1509,6 +1616,16 @@ impl HyprConfig {
                 "follow_mouse" => {
                     if let Ok(n) = v.parse() {
                         self.input.follow_mouse = n;
+                    }
+                }
+                "hover_delay_ms" => {
+                    if let Ok(n) = v.parse() {
+                        self.input.hover_delay_ms = n;
+                    }
+                }
+                "keyboard_grace_ms" => {
+                    if let Ok(n) = v.parse() {
+                        self.input.keyboard_grace_ms = n;
                     }
                 }
                 "sensitivity" => {
@@ -1625,6 +1742,14 @@ impl HyprConfig {
                     });
                 }
             }
+            "submap" => {
+                let s = v.trim();
+                if s.is_empty() || s.eq_ignore_ascii_case("reset") {
+                    self.current_submap.clear();
+                } else {
+                    self.current_submap = s.to_ascii_lowercase();
+                }
+            }
             "bind" | "bindr" | "binde" | "bindm" | "bindl" => {
                 let kind = match kw.as_str() {
                     "bindr" => BindKind::Release,
@@ -1632,7 +1757,7 @@ impl HyprConfig {
                     "bindm" => BindKind::Mouse,
                     _ => BindKind::Press,
                 };
-                // Format: `$mainMod, Q, exec, wt.exe` or `$mainMod, mouse:272, movewindow`
+                // Format: `$mainMod, Q, exec, wt.exe`, `$mainMod, K > R, submap, resize`, or `$mainMod, mouse:272, movewindow`
                 let mut parts = v.splitn(4, ',').map(|s| s.trim());
                 let mods = parts.next().unwrap_or("").to_string();
                 let key = parts.next().unwrap_or("").to_string();
@@ -1645,6 +1770,7 @@ impl HyprConfig {
                         key,
                         dispatcher,
                         arg,
+                        submap: self.current_submap.clone(),
                     });
                 }
             }
@@ -1778,13 +1904,18 @@ misc {
     run_as_admin = false
     # Anti-Cheat Safe Switch: false = Standard Win32/DirectComposition mode, true = Experimental uDWM PDB Hook
     dwm_hook_enabled = false
-    # Window classes resized with a stretched GPU preview while dragging (real resize on release)
-    resize_preview_classes = MozillaWindowClass
+    # Window classes resized with a stretched GPU preview while dragging (real resize on release).
+    # None by default: every window resizes for real. Example: MozillaWindowClass
+    resize_preview_classes =
 }
 
 input {
     kb_layout = us
     follow_mouse = 1
+    # Cursor must rest this long over a tile before it takes focus
+    hover_delay_ms = 0
+    # Hover focus is ignored this long after a key press
+    keyboard_grace_ms = 400
     sensitivity = 0.0
     repeat_rate = 30
     repeat_delay = 300
@@ -1853,6 +1984,26 @@ binde = $mainMod CTRL, Right, resizeactive, 40 0
 binde = $mainMod CTRL, Up, resizeactive, 0 -40
 binde = $mainMod CTRL, Down, resizeactive, 0 40
 
+# Keybind cheat-sheet overlay & chain chords
+bind = $mainMod, F1, cheatsheet,
+bind = $mainMod, K > R, submap, resize
+bind = $mainMod, K > B, exec, henbrowser.exe
+bind = $mainMod, K > F, files,
+
+# Modal layer: resize mode (Mod+K, then R to enter; Esc or Return to exit)
+submap = resize
+binde = , Left, resizeactive, -40 0
+binde = , Right, resizeactive, 40 0
+binde = , Up, resizeactive, 0 -40
+binde = , Down, resizeactive, 0 40
+binde = , H, resizeactive, -40 0
+binde = , L, resizeactive, 40 0
+binde = , K, resizeactive, 0 -40
+binde = , J, resizeactive, 0 40
+bind = , Escape, submap, reset
+bind = , Return, submap, reset
+submap = reset
+
 # Mouse bindings ($mainMod + LMB to move, $mainMod + RMB to resize)
 bindm = $mainMod, mouse:272, movewindow
 bindm = $mainMod, mouse:273, resizewindow
@@ -1860,6 +2011,15 @@ bindm = $mainMod, mouse:273, resizewindow
 
 /// Ensures `~/.config/chickenwm/chickenwm.conf` exists (creating default if missing),
 /// then parses and returns both the lossless `ConfigDocument` AST and compiled `HyprConfig`.
+/// `~/x` (or `~\x`) → the user's home folder joined with `x`; other paths unchanged.
+pub fn expand_home(path: &str) -> PathBuf {
+    let rest = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"));
+    match (rest, std::env::var_os("USERPROFILE")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
 pub fn load_or_init_config() -> Result<(ConfigDocument, HyprConfig)> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
@@ -1940,6 +2100,32 @@ mod tests {
         let cfg = doc.compile();
         assert_eq!(cfg.misc.fps_limit, 144);
         assert_eq!(cfg.general.gaps_in, 12);
+    }
+
+    /// Hand-edited files come back byte for byte: odd indentation, tabs, trailing comments,
+    /// `#` inside colours, lines the parser doesn't understand, nested and unclosed sections.
+    #[test]
+    fn messy_config_round_trips_exactly() {
+        let src = "# top comment\n\n$mod=SUPER   # trailing\ngeneral {\n\tgaps_in=3\n      col.active_border = rgba(33ccffee) #ff0000 45deg # comment\n    what is this line\n    decoration {\n        nested = 1\n    }   # closing comment\n}\nbind = $mod, Q, killactive\n\ninput {\n    kb_layout = tr\n";
+        let doc = ConfigDocument::parse(src).unwrap();
+        assert_eq!(doc.to_lossless_string().trim_end(), src.trim_end());
+        // Editing one key leaves every other line as it was.
+        let mut doc = ConfigDocument::parse(src).unwrap();
+        doc.set_category_key("general", "gaps_in", "7");
+        let out = doc.to_lossless_string();
+        assert!(out.contains("gaps_in = 7") || out.contains("gaps_in=7"), "{out}");
+        for keep in ["$mod=SUPER   # trailing", "    what is this line", "    }   # closing comment", "bind = $mod, Q, killactive"] {
+            assert!(out.contains(keep), "lost `{keep}` in:\n{out}");
+        }
+        assert_eq!(doc.compile().general.gaps_in, 7);
+    }
+
+    /// The user's own chickenwm.conf (when there is one) survives a parse / save untouched.
+    #[test]
+    fn user_config_round_trips_exactly() {
+        let Ok(text) = std::fs::read_to_string(config_file_path()) else { return };
+        let doc = ConfigDocument::parse(&text).unwrap();
+        assert_eq!(doc.to_lossless_string().trim_end().replace("\r\n", "\n"), text.trim_end().replace("\r\n", "\n"));
     }
 
     #[test]

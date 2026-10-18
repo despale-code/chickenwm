@@ -454,6 +454,23 @@ pub const DEFAULT_ROOBAR_CSS: &str = r#"/* ChickenWM Status Bar (roobar) Theme (
     --bar-margin-x: 10px;
     --font-family: "Cascadia Code", "Segoe UI", sans-serif;
     --font-size: 13px;
+
+    /* Widgets on the right, left to right. Library: media tray notifications stats cpu memory refresh-rate
+       network volume bluetooth files settings clock power menu (any order, any subset). */
+    --modules-right: media stats tray network volume bluetooth clock notifications menu;
+    /* These share one pill, in this order (`none` gives every widget its own). */
+    --modules-group: network volume bluetooth clock notifications;
+    --islands: true;                     /* false: one background and border for the whole bar */
+    --tray-visible: 4;                   /* tray icons shown before the overflow chevron */
+    --clock-format: %a %Y-%m-%d  %H:%M;  /* %a %A %b %B %d %e %m %y %Y %H %I %M %S %p */
+    --refresh-rate-dwm: true;            /* refresh-rate widget: show "· udwm" when hooked */
+    --network-label: false;              /* Wi-Fi name / "ethernet" next to the icon */
+    --bluetooth-label: false;            /* connected device next to the icon */
+    --volume-step: 5;                    /* percent per scroll notch */
+    /* Override any widget's mouse gestures: --<widget>-on-click / -on-middle / -on-right /
+       -on-scroll-up / -on-scroll-down, set to `exec <command>`, `open <uri or path>`,
+       `dispatch <dispatcher> <arg>` or `none`. Unset keeps the built-in behaviour. */
+    /* --clock-on-right: open ms-settings:dateandtime; */
 }
 
 window#roobar {

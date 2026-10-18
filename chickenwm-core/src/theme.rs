@@ -67,6 +67,9 @@ pub struct ThemeConfig {
     /// the palette is generated from `accent`.
     #[serde(default)]
     pub preset: String,
+    /// Switches `mode` between light and dark by the clock (see `theme_tools`).
+    #[serde(default)]
+    pub auto_dark: crate::theme_tools::AutoDark,
 }
 
 impl Default for ThemeConfig {
@@ -77,6 +80,7 @@ impl Default for ThemeConfig {
             icon_theme: "chickenwm".to_string(),
             app_modes: Vec::new(),
             preset: String::new(),
+            auto_dark: Default::default(),
         }
     }
 }

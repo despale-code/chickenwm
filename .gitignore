@@ -27,3 +27,6 @@ desktop.ini
 
 # Personal notes
 /new-todo.txt
+
+# Release packages (scripts/release.ps1)
+/dist/
