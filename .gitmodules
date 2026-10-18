@@ -1,0 +1,42 @@
+[submodule "chickenwm-core"]
+	path = chickenwm-core
+	url = https://github.com/despale-code/chickenwm-core.git
+[submodule "chickenwm-rooster"]
+	path = chickenwm-rooster
+	url = https://github.com/despale-code/chickenwm-rooster.git
+[submodule "chickenwm-wm"]
+	path = chickenwm-wm
+	url = https://github.com/despale-code/chickenwm-wm.git
+[submodule "chickenwm-binds"]
+	path = chickenwm-binds
+	url = https://github.com/despale-code/chickenwm-binds.git
+[submodule "chickenwm-paper"]
+	path = chickenwm-paper
+	url = https://github.com/despale-code/chickenwm-paper.git
+[submodule "chickenwm-launcher"]
+	path = chickenwm-launcher
+	url = https://github.com/despale-code/chickenwm-launcher.git
+[submodule "chickenwm-files"]
+	path = chickenwm-files
+	url = https://github.com/despale-code/chickenwm-files.git
+[submodule "chickenwm-notify"]
+	path = chickenwm-notify
+	url = https://github.com/despale-code/chickenwm-notify.git
+[submodule "chickenwm-settings"]
+	path = chickenwm-settings
+	url = https://github.com/despale-code/chickenwm-settings.git
+[submodule "chickenwm-dwm-hook"]
+	path = chickenwm-dwm-hook
+	url = https://github.com/despale-code/chickenwm-dwm-hook.git
+[submodule "roobar"]
+	path = roobar
+	url = https://github.com/despale-code/roobar.git
+[submodule "chickenctl"]
+	path = chickenctl
+	url = https://github.com/despale-code/chickenctl.git
+[submodule "chickenwm-shot"]
+	path = chickenwm-shot
+	url = https://github.com/despale-code/chickenwm-shot.git
+[submodule "henbrowser"]
+	path = henbrowser
+	url = https://github.com/despale-code/henbrowser.git

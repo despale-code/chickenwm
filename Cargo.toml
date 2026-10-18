@@ -1,3 +1,7 @@
+# ChickenWM: every program lives in its own repository and is checked out here as a git
+# submodule (`git clone --recursive`). This workspace builds them all together. The patches make
+# the members use the local chickenwm-core / chickenwm-dwm-hook folders instead of the tagged
+# GitHub copies, so a change to core is picked up straight away.
 [workspace]
 resolver = "2"
 members = [
@@ -17,65 +21,8 @@ members = [
     "chickenwm-shot",
 ]
 
-[workspace.package]
-version = "0.1.1"
-edition = "2024"
-authors = ["ChickenWM Contributors"]
-license = "MIT"
-repository = "https://github.com/despale-code/chickenwm"
-
-[workspace.dependencies]
+[patch."https://github.com/despale-code/chickenwm-core"]
 chickenwm-core = { path = "chickenwm-core" }
+
+[patch."https://github.com/despale-code/chickenwm-dwm-hook"]
 chickenwm-dwm-hook = { path = "chickenwm-dwm-hook" }
-tokio = { version = "1.43", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-anyhow = "1.0"
-thiserror = "2.0"
-winnow = "0.7"
-notify = "8.0"
-nucleo-matcher = "0.3"
-dirs = "6.0"
-parking_lot = "0.12"
-crossbeam-channel = "0.5"
-clap = { version = "4.5", features = ["derive"] }
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
-egui = "0.31"
-wgpu = "24.0"
-pdb = "0.8"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-zip = { version = "9.0", default-features = false, features = ["deflate"] }
-flate2 = "1.0"
-tar = "0.4"
-windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_System_Pipes",
-    "Win32_System_StationsAndDesktops",
-    "Win32_System_IO",
-    "Win32_System_Memory",
-    "Win32_System_Registry",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Performance",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Console",
-    "Win32_System_Com",
-    "Win32_System_SystemServices",
-    "Win32_System_SystemInformation",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Accessibility",
-    "Win32_UI_Shell",
-    "Win32_UI_HiDpi",
-    "Win32_Graphics_Gdi",
-    "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-] }

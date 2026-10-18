@@ -110,6 +110,16 @@ function Get-Installed {
     return @()
 }
 
+function Confirm-DwmHook {
+    Write-Host ''
+    Say 'WARNING: the DWM hook injects code into dwm.exe, the Windows compositor.' 'Red'
+    Say 'Games with anti-cheat (Easy Anti-Cheat, BattlEye, Riot Vanguard, FACEIT, ...) can treat that' 'Red'
+    Say 'as tampering: they may refuse to start, and an account could be flagged or banned.' 'Red'
+    Say 'It is experimental and can also make the desktop unstable.' 'Red'
+    Say 'Installing it does not turn it on: it stays off until you pick "DWM hook" in Settings > Displays.' 'DarkYellow'
+    return (Ask 'Install the DWM hook anyway?')
+}
+
 function Select-Components {
     $installed = Get-Installed
     $chosen = @{}
@@ -123,7 +133,11 @@ function Select-Components {
         $wanted = $env:CHICKENWM_COMPONENTS -split '[,; ]+' | Where-Object { $_ }
         foreach ($item in $Catalog) { $chosen[$item.Repo] = $item.Required -or ($wanted -contains $item.Repo) }
     }
-    if ($Assume -or $env:CHICKENWM_COMPONENTS -or $env:CHICKENWM_ALL -eq '1') { return $chosen }
+    if ($Assume -or $env:CHICKENWM_COMPONENTS -or $env:CHICKENWM_ALL -eq '1') {
+        # Asked for by name (or kept from an earlier install): still say what it means.
+        if ($chosen['chickenwm-dwm-hook'] -and -not (Confirm-DwmHook)) { $chosen['chickenwm-dwm-hook'] = $false }
+        return $chosen
+    }
 
     while ($true) {
         Write-Host ''
@@ -143,10 +157,7 @@ function Select-Components {
             $item = $Catalog[$n - 1]
             if ($item.Required) { continue }
             if ($item.Repo -eq 'chickenwm-dwm-hook' -and -not $chosen[$item.Repo]) {
-                Say 'The DWM hook injects into dwm.exe. Games with anti-cheat (Easy Anti-Cheat, BattlEye,' 'Red'
-                Say 'Vanguard, FACEIT, ...) may refuse to start or flag your account while it is enabled.' 'Red'
-                Say 'It stays off until you turn it on in Settings > Displays; installing it alone does nothing.' 'Red'
-                if (-not (Ask 'Install it anyway?')) { continue }
+                if (-not (Confirm-DwmHook)) { continue }
             }
             $chosen[$item.Repo] = -not $chosen[$item.Repo]
         }
@@ -267,6 +278,9 @@ function Install-ChickenWM {
     Say "Installed: $(($items | ForEach-Object { $_.Title }) -join ', ')" 'Green'
     Say 'Start it from the Start Menu (ChickenWM), or run chickenwm-rooster. Your settings live in %USERPROFILE%\.config\chickenwm.'
     Say 'Emergency restore at any time: Ctrl + Alt + Shift + Esc.'
+    if ($chosen['chickenwm-dwm-hook']) {
+        Say 'The DWM hook is installed but off. Only turn it on (Settings > Displays) if you do not play games with anti-cheat.' 'DarkYellow'
+    }
     if ($wasRunning -or (Ask 'Start ChickenWM now?')) { Start-Process $rooster -WorkingDirectory $InstallDir }
 }
 
