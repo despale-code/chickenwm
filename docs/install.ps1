@@ -194,7 +194,21 @@ function Select-Components {
 
 # --- Building ---------------------------------------------------------------------------------
 
+# Each program builds into its own folder. Every repository is a separate Cargo workspace with its
+# own features, and sharing one target folder between them mixes up differently-built copies of the
+# same crate (seen as "multiple different versions of crate serde_core" errors).
+function Get-ComponentRelease($item) { Join-Path (Join-Path $CacheDir $item.Repo) 'release' }
+
+# Builds from before the per-program folders kept everything in one shared folder.
+function Remove-SharedBuildCache {
+    foreach ($old in 'release', 'debug') {
+        $path = Join-Path $CacheDir $old
+        if (Test-Path $path) { Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Build-Component($item, $srcRoot, $commit) {
+    $env:CARGO_TARGET_DIR = Join-Path $CacheDir $item.Repo
     $zip = Join-Path $srcRoot "$($item.Repo).zip"
     # A known commit is built exactly (so installed.json can say what is installed).
     $url = if ($commit) { "https://github.com/$Org/$($item.Repo)/archive/$commit.zip" } else { "https://github.com/$Org/$($item.Repo)/archive/refs/heads/main.zip" }
@@ -242,7 +256,7 @@ function Install-ChickenWM {
     Step "Building $($items.Count) programs (the first build takes a while)"
     $srcRoot = Join-Path $env:TEMP 'chickenwm-install'
     New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
-    $env:CARGO_TARGET_DIR = $CacheDir
+    Remove-SharedBuildCache
     $commits = @{}
     $n = 0
     foreach ($item in $items) {
@@ -255,8 +269,8 @@ function Install-ChickenWM {
     Step 'Installing'
     $wasRunning = Stop-ChickenWM
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
-    $release = Join-Path $CacheDir 'release'
     foreach ($item in $items) {
+        $release = Get-ComponentRelease $item
         foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
     }
 
@@ -365,7 +379,7 @@ function Update-ChickenWM([bool]$checkOnly) {
     Install-Requirements
     $srcRoot = Join-Path $env:TEMP 'chickenwm-install'
     New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
-    $env:CARGO_TARGET_DIR = $CacheDir
+    Remove-SharedBuildCache
     Step "Updating $($pending.Count) program(s), one by one"
     $built = @()
     foreach ($item in $pending) {
@@ -384,8 +398,8 @@ function Update-ChickenWM([bool]$checkOnly) {
 
     Step 'Installing'
     $wasRunning = Stop-ChickenWM
-    $release = Join-Path $CacheDir 'release'
     foreach ($item in $built) {
+        $release = Get-ComponentRelease $item
         foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
         $installedCommits[$item.Repo] = $latest[$item.Repo]
         Report $item.Repo 'installed'
