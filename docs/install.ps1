@@ -127,8 +127,15 @@ function Report($repo, $state, $text = '') {
     if ($Machine) { [Console]::Out.WriteLine("@@ $repo $state $text"); [Console]::Out.Flush() }
 }
 
-# The newest commit of a program's repository (what an update would install).
+# The newest commit of a program's repository (what an update would install). Read from git's
+# own HTTP endpoint, which (unlike the GitHub API, 60 requests an hour without a token) has no
+# rate limit; the API is the fallback.
 function Get-LatestCommit($repo) {
+    try {
+        $refs = Invoke-WebRequest "https://github.com/$Org/$repo.git/info/refs?service=git-upload-pack" -UseBasicParsing -Headers @{ 'User-Agent' = 'git/2.45 chickenwm-installer' }
+        $text = if ($refs.Content -is [byte[]]) { [Text.Encoding]::ASCII.GetString($refs.Content) } else { [string]$refs.Content }
+        if ($text -match '([0-9a-f]{40}) refs/heads/main') { return $Matches[1] }
+    } catch {}
     try {
         $r = Invoke-RestMethod "https://api.github.com/repos/$Org/$repo/commits/main" -Headers @{ 'User-Agent' = 'chickenwm-installer'; 'Accept' = 'application/vnd.github+json' }
         return $r.sha
