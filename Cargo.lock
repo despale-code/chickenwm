@@ -856,6 +856,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "notify",
  "nucleo-matcher",
  "parking_lot",
  "raw-window-handle",
@@ -939,10 +940,7 @@ dependencies = [
  "anyhow",
  "chickenwm-core",
  "dirs 6.0.0",
- "eframe",
- "egui",
  "image",
- "raw-window-handle",
  "tracing",
  "windows 0.58.0",
 ]
