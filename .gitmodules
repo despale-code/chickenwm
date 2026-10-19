@@ -25,9 +25,6 @@
 [submodule "chickenwm-settings"]
 	path = chickenwm-settings
 	url = https://github.com/despale-code/chickenwm-settings.git
-[submodule "chickenwm-dwm-hook"]
-	path = chickenwm-dwm-hook
-	url = https://github.com/despale-code/chickenwm-dwm-hook.git
 [submodule "roobar"]
 	path = roobar
 	url = https://github.com/despale-code/roobar.git

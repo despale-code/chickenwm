@@ -62,7 +62,6 @@ ChickenWM is a set of small programs that talk to each other over a named pipe
 | `chickenwm-settings.exe` | Settings app in the style of macOS System Settings (searchable sidebar, grouped cards). Edits `chickenwm.conf` without destroying your formatting; has the theme gallery, CSS editor, bezier curve editor, shortcut recorder and window-rule inspector. `--page appearance` opens a page directly. |
 | `henbrowser.exe` | A lightweight browser on Microsoft Edge WebView2 with tabs, built-in ad/tracker blocking, Chromium extensions (Proton Pass works) and memory-saving options. |
 | `chickenctl.exe` | Command-line control: reload, dispatch commands, list windows/monitors, set wallpaper, change the theme, emergency restore. Modeled on Hyprland's `hyprctl`. |
-| `chickenwm-dwm-hook.exe` | **Experimental, off by default.** Injects into `dwm.exe` for lower-latency effects. Can trip anti-cheat software; leave it off if you play online games. |
 
 ## Requirements
 
@@ -85,7 +84,7 @@ irm https://despale-code.github.io/chickenwm/install.ps1 | iex
 
 The installer (also on [the website](https://despale-code.github.io/chickenwm/)) lets you pick
 which programs to install; the core is always included, Hen Browser, the file explorer and the
-others are optional, and the DWM hook is off unless you tick it. It downloads each program's
+others are optional. It downloads each program's
 source from GitHub and builds it with Rust (installing Rust through rustup if needed; it uses the
 GNU toolchain, so no Visual Studio is required), then installs for your user only into
 `%LOCALAPPDATA%\Programs\ChickenWM`: Start Menu shortcuts, App Paths registrations (Win + R,
@@ -266,7 +265,6 @@ misc {
     suppress_explorer = true            # close explorer.exe while rooster runs
     replace_winlogon_shell = false
     register_files_handler = false      # chickenwm-files as default file manager
-    dwm_hook_enabled = false            # experimental; can trip anti-cheat
 }
 
 windowrulev2 = float, class:^(Taskmgr)$
@@ -282,7 +280,7 @@ bindm = $mainMod, mouse:272, movewindow
 | `animations` | `enabled`, `first_launch_animation`, `bezier = name, x0, y0, x1, y1`, `animation = name, on, speed, curve[, style]` |
 | `dwindle` | `pseudotile`, `preserve_split`, `force_split`, `default_split_ratio`, `smart_gaps` |
 | `master` | `mfact`, `orientation`, `new_status`, `smart_gaps` |
-| `misc` | `vfr`, `fps_limit`, `suppress_explorer`, `replace_winlogon_shell`, `register_files_handler`, `dwm_hook_enabled`, `resize_preview_classes` |
+| `misc` | `vfr`, `fps_limit`, `suppress_explorer`, `replace_winlogon_shell`, `register_files_handler`, `resize_preview_classes` |
 | `input` | `kb_layout`, `follow_mouse`, `sensitivity`, `repeat_rate`, `repeat_delay` |
 | top level | `monitor`, `exec-once`, `bind` / `binde` / `bindr` / `bindm`, `windowrulev2`, `wallpaper`, `$variables` |
 
@@ -491,12 +489,11 @@ cargo run -p chickenwm-rooster -- --no-children   # daemon only, start modules y
 | `chickenwm-settings/` | [chickenwm-settings](https://github.com/despale-code/chickenwm-settings) | Settings |
 | `henbrowser/` | [henbrowser](https://github.com/despale-code/henbrowser) | Hen Browser |
 | `chickenctl/` | [chickenctl](https://github.com/despale-code/chickenctl) | CLI |
-| `chickenwm-dwm-hook/` | [chickenwm-dwm-hook](https://github.com/despale-code/chickenwm-dwm-hook) | Experimental DWM injection |
 
 Each program lives in its own repository and is checked out here as a git submodule (clone with
 `--recursive`, or run `git submodule update --init` afterwards). The workspace in this repository
-builds them all together; it patches the members' GitHub dependencies on `chickenwm-core` and
-`chickenwm-dwm-hook` to the local folders, so a change to core is picked up straight away. Commit
+builds them all together; it patches the members' GitHub dependencies on `chickenwm-core`
+to the local folder, so a change to core is picked up straight away. Commit
 and push inside a program's folder to update its repository, then commit the new submodule
 pointer here. Icons for every program are in `pictures/icons/`.
 
@@ -520,8 +517,6 @@ Logs go to stdout; run a module from a terminal to see them. Set `RUST_LOG=debug
 - **The browser doesn't start**: install the
   [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) and keep
   `WebView2Loader.dll` next to `henbrowser.exe`.
-- **Anti-cheat warnings**: make sure `dwm_hook_enabled = false` (Settings → Display → Anti-Cheat Safe
-  Switch).
 - **Theme changes don't show**: every module hot-reloads its CSS; if one doesn't, run
   `chickenctl reload` or restart that program.
 

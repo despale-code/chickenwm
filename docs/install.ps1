@@ -38,7 +38,6 @@ $Catalog = @(
     @{ Repo = 'chickenwm-files';    Title = 'Files';                   Files = @('chickenwm-files.exe');    Shortcut = 'ChickenWM Files';      Required = $false; Default = $true;  About = 'File explorer' }
     @{ Repo = 'chickenwm-shot';     Title = 'Screenshots';             Files = @('chickenwm-shot.exe');     Shortcut = 'ChickenWM Screenshot'; Required = $false; Default = $true;  About = 'Region, window and screen captures' }
     @{ Repo = 'henbrowser';         Title = 'Hen Browser';             Files = @('henbrowser.exe', 'WebView2Loader.dll'); Shortcut = 'Hen Browser'; Required = $false; Default = $true; About = 'Web browser on WebView2' }
-    @{ Repo = 'chickenwm-dwm-hook'; Title = 'DWM hook (experimental)'; Files = @('chickenwm-dwm-hook.exe', 'chickenwm_dwm_hook.dll'); Shortcut = $null; Required = $false; Default = $false; About = 'WARNING: can trip game anti-cheat; leave off if you play online' }
 )
 
 $InstallDir = if ($env:CHICKENWM_DIR) { $env:CHICKENWM_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\ChickenWM' }
@@ -144,15 +143,6 @@ function Get-LatestCommit($repo) {
     }
 }
 
-function Confirm-DwmHook {
-    Write-Host ''
-    Say 'WARNING: the DWM hook injects code into dwm.exe, the Windows compositor.' 'Red'
-    Say 'Games with anti-cheat (Easy Anti-Cheat, BattlEye, Riot Vanguard, FACEIT, ...) can treat that' 'Red'
-    Say 'as tampering: they may refuse to start, and an account could be flagged or banned.' 'Red'
-    Say 'It is experimental and can also make the desktop unstable.' 'Red'
-    Say 'Installing it does not turn it on: it stays off until you pick "DWM hook" in Settings > Displays.' 'DarkYellow'
-    return (Ask 'Install the DWM hook anyway?')
-}
 
 function Select-Components {
     $installed = Get-Installed
@@ -161,7 +151,7 @@ function Select-Components {
         $chosen[$item.Repo] = $item.Required -or ($(if ($installed.Count) { $installed -contains $item.Repo } else { $item.Default }))
     }
     if ($env:CHICKENWM_ALL -eq '1') {
-        foreach ($item in $Catalog) { if ($item.Repo -ne 'chickenwm-dwm-hook') { $chosen[$item.Repo] = $true } }
+        foreach ($item in $Catalog) { $chosen[$item.Repo] = $true }
     }
     if ($env:CHICKENWM_COMPONENTS) {
         $wanted = $env:CHICKENWM_COMPONENTS -split '[,; ]+' | Where-Object { $_ }
@@ -169,7 +159,6 @@ function Select-Components {
     }
     if ($Assume -or $env:CHICKENWM_COMPONENTS -or $env:CHICKENWM_ALL -eq '1') {
         # Asked for by name (or kept from an earlier install): still say what it means.
-        if ($chosen['chickenwm-dwm-hook'] -and -not (Confirm-DwmHook)) { $chosen['chickenwm-dwm-hook'] = $false }
         return $chosen
     }
 
@@ -180,7 +169,7 @@ function Select-Components {
             $item = $Catalog[$i]
             $mark = if ($chosen[$item.Repo]) { '[x]' } else { '[ ]' }
             $lock = if ($item.Required) { ' (required)' } else { '' }
-            $color = if ($item.Repo -eq 'chickenwm-dwm-hook') { 'DarkYellow' } elseif ($item.Required) { 'DarkGray' } else { 'Gray' }
+            $color = if ($item.Required) { 'DarkGray' } else { 'Gray' }
             Write-Host ("  {0,2}. {1} {2,-26} {3}{4}" -f ($i + 1), $mark, $item.Title, $item.About, $lock) -ForegroundColor $color
         }
         $answer = Read-Host 'Toggle'
@@ -190,9 +179,6 @@ function Select-Components {
             if (-not [int]::TryParse($part, [ref]$n) -or $n -lt 1 -or $n -gt $Catalog.Count) { continue }
             $item = $Catalog[$n - 1]
             if ($item.Required) { continue }
-            if ($item.Repo -eq 'chickenwm-dwm-hook' -and -not $chosen[$item.Repo]) {
-                if (-not (Confirm-DwmHook)) { continue }
-            }
             $chosen[$item.Repo] = -not $chosen[$item.Repo]
         }
     }
@@ -329,9 +315,7 @@ function Install-ChickenWM {
     Say "Installed: $(($items | ForEach-Object { $_.Title }) -join ', ')" 'Green'
     Say 'Start it from the Start Menu (ChickenWM), or run chickenwm-rooster. Your settings live in %USERPROFILE%\.config\chickenwm.'
     Say 'Emergency restore at any time: Ctrl + Alt + Shift + Esc.'
-    if ($chosen['chickenwm-dwm-hook']) {
-        Say 'The DWM hook is installed but off. Only turn it on (Settings > Displays) if you do not play games with anti-cheat.' 'DarkYellow'
-    }
+
     if ($wasRunning -or (Ask 'Start ChickenWM now?')) { Start-Process $rooster -WorkingDirectory $InstallDir }
 }
 

@@ -1,6 +1,6 @@
 # ChickenWM: every program lives in its own repository and is checked out here as a git
 # submodule (`git clone --recursive`). This workspace builds them all together. The patches make
-# the members use the local chickenwm-core / chickenwm-dwm-hook folders instead of the tagged
+# the members use the local chickenwm-core folder instead of the tagged
 # GitHub copies, so a change to core is picked up straight away.
 [workspace]
 resolver = "2"
@@ -14,7 +14,6 @@ members = [
     "chickenwm-files",
     "chickenwm-notify",
     "chickenwm-settings",
-    "chickenwm-dwm-hook",
     "roobar",
     "chickenctl",
     "henbrowser",
@@ -24,5 +23,3 @@ members = [
 [patch."https://github.com/despale-code/chickenwm-core"]
 chickenwm-core = { path = "chickenwm-core" }
 
-[patch."https://github.com/despale-code/chickenwm-dwm-hook"]
-chickenwm-dwm-hook = { path = "chickenwm-dwm-hook" }
