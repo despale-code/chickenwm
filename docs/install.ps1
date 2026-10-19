@@ -12,6 +12,9 @@
 #   $env:CHICKENWM_ALL = "1"                                   install every optional program
 #   $env:CHICKENWM_YES = "1"                                   don't ask (installs Rust if needed)
 #   $env:CHICKENWM_DIR = "D:\Apps\ChickenWM"                   install somewhere else
+#   $env:CHICKENWM_UPDATE = "1"                                update: rebuild only the programs whose
+#                                                              repository changed (or "check": just list them)
+# Updating: update.ps1 next to this file, `chickenctl update`, or Settings > General > Updates.
 # Uninstall: Settings > Apps > ChickenWM, or run `uninstall.ps1` in the install folder.
 
 $ErrorActionPreference = 'Stop'
@@ -104,10 +107,34 @@ function Install-Requirements {
 
 # --- Picking programs -------------------------------------------------------------------------
 
-function Get-Installed {
+function Get-InstalledInfo {
     $file = Join-Path $InstallDir 'installed.json'
-    if (Test-Path $file) { return @((Get-Content $file -Raw | ConvertFrom-Json).components) }
+    if (Test-Path $file) { return (Get-Content $file -Raw | ConvertFrom-Json) }
+    return $null
+}
+
+function Get-Installed {
+    $info = Get-InstalledInfo
+    if ($info) { return @($info.components) }
     return @()
+}
+
+# Progress for the Settings app, which runs this hidden and reads these lines:
+# "@@ <repo> <state> [text]" with states checking, current, available, building, built, installed,
+# failed; and "@@ done <count>" / "@@ error <text>" at the end.
+$Machine = $env:CHICKENWM_MACHINE -eq '1'
+function Report($repo, $state, $text = '') {
+    if ($Machine) { [Console]::Out.WriteLine("@@ $repo $state $text"); [Console]::Out.Flush() }
+}
+
+# The newest commit of a program's repository (what an update would install).
+function Get-LatestCommit($repo) {
+    try {
+        $r = Invoke-RestMethod "https://api.github.com/repos/$Org/$repo/commits/main" -Headers @{ 'User-Agent' = 'chickenwm-installer'; 'Accept' = 'application/vnd.github+json' }
+        return $r.sha
+    } catch {
+        return $null
+    }
 }
 
 function Confirm-DwmHook {
@@ -167,9 +194,10 @@ function Select-Components {
 
 # --- Building ---------------------------------------------------------------------------------
 
-function Build-Component($item, $srcRoot) {
+function Build-Component($item, $srcRoot, $commit) {
     $zip = Join-Path $srcRoot "$($item.Repo).zip"
-    $url = "https://github.com/$Org/$($item.Repo)/archive/refs/heads/main.zip"
+    # A known commit is built exactly (so installed.json can say what is installed).
+    $url = if ($commit) { "https://github.com/$Org/$($item.Repo)/archive/$commit.zip" } else { "https://github.com/$Org/$($item.Repo)/archive/refs/heads/main.zip" }
     Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
     $dest = Join-Path $srcRoot $item.Repo
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
@@ -215,11 +243,13 @@ function Install-ChickenWM {
     $srcRoot = Join-Path $env:TEMP 'chickenwm-install'
     New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
     $env:CARGO_TARGET_DIR = $CacheDir
+    $commits = @{}
     $n = 0
     foreach ($item in $items) {
         $n++
         Say ("[{0}/{1}] {2}" -f $n, $items.Count, $item.Title) 'White'
-        Build-Component $item $srcRoot
+        $commits[$item.Repo] = Get-LatestCommit $item.Repo
+        Build-Component $item $srcRoot $commits[$item.Repo]
     }
 
     Step 'Installing'
@@ -260,7 +290,7 @@ function Install-ChickenWM {
     # The uninstaller and the record of what is installed.
     $uninstaller = Join-Path $InstallDir 'uninstall.ps1'
     Set-Content -Path $uninstaller -Value $UninstallScript -Encoding UTF8
-    @{ version = $Version; components = @($items | ForEach-Object { $_.Repo }) } | ConvertTo-Json | Set-Content (Join-Path $InstallDir 'installed.json') -Encoding UTF8
+    Save-InstalledInfo @($items | ForEach-Object { $_.Repo }) $commits
 
     New-Item -Path $UninstallKey -Force | Out-Null
     $rooster = Join-Path $InstallDir 'chickenwm-rooster.exe'
@@ -282,6 +312,88 @@ function Install-ChickenWM {
         Say 'The DWM hook is installed but off. Only turn it on (Settings > Displays) if you do not play games with anti-cheat.' 'DarkYellow'
     }
     if ($wasRunning -or (Ask 'Start ChickenWM now?')) { Start-Process $rooster -WorkingDirectory $InstallDir }
+}
+
+# Records what is installed and at which commit (compared by updates).
+function Save-InstalledInfo($components, $commits) {
+    $map = [ordered]@{}
+    foreach ($repo in $components) { if ($commits[$repo]) { $map[$repo] = $commits[$repo] } }
+    [ordered]@{ version = $Version; components = @($components); commits = $map } |
+        ConvertTo-Json -Depth 3 | Set-Content (Join-Path $InstallDir 'installed.json') -Encoding UTF8
+}
+
+# Update: compares every installed program with its repository, then downloads, builds and
+# installs the ones that changed, one by one. $checkOnly just reports what has an update.
+function Update-ChickenWM([bool]$checkOnly) {
+    $script:Assume = $true
+    $info = Get-InstalledInfo
+    if (-not $info) {
+        throw "No installation found in $InstallDir. Install with: irm https://$Org.github.io/chickenwm/install.ps1 | iex"
+    }
+    Say "ChickenWM updater ($InstallDir)" 'Cyan'
+    $installedCommits = @{}
+    if ($info.commits) { foreach ($p in $info.commits.PSObject.Properties) { $installedCommits[$p.Name] = $p.Value } }
+    $items = @($Catalog | Where-Object { @($info.components) -contains $_.Repo })
+
+    Step 'Checking for updates'
+    $latest = @{}
+    $pending = @()
+    foreach ($item in $items) {
+        Report $item.Repo 'checking'
+        $sha = Get-LatestCommit $item.Repo
+        if (-not $sha) {
+            Say ("  {0,-26} couldn't reach GitHub" -f $item.Title) 'Red'
+            Report $item.Repo 'failed' "couldn't reach GitHub"
+            continue
+        }
+        $latest[$item.Repo] = $sha
+        if ($installedCommits[$item.Repo] -eq $sha) {
+            Say ("  {0,-26} up to date" -f $item.Title) 'DarkGray'
+            Report $item.Repo 'current'
+        } else {
+            Say ("  {0,-26} update available ({1})" -f $item.Title, $sha.Substring(0, 7)) 'White'
+            Report $item.Repo 'available' $sha.Substring(0, 7)
+            $pending += $item
+        }
+    }
+    if ($checkOnly -or -not $pending.Count) {
+        if (-not $pending.Count) { Say 'Everything is up to date.' 'Green' }
+        Report 'done' $pending.Count
+        return
+    }
+
+    Install-Requirements
+    $srcRoot = Join-Path $env:TEMP 'chickenwm-install'
+    New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
+    $env:CARGO_TARGET_DIR = $CacheDir
+    Step "Updating $($pending.Count) program(s), one by one"
+    $built = @()
+    foreach ($item in $pending) {
+        Say "  $($item.Title)" 'White'
+        Report $item.Repo 'building'
+        try {
+            Build-Component $item $srcRoot $latest[$item.Repo]
+            Report $item.Repo 'built'
+            $built += $item
+        } catch {
+            Say "    failed: $($_.Exception.Message)" 'Red'
+            Report $item.Repo 'failed' $_.Exception.Message
+        }
+    }
+    if (-not $built.Count) { Report 'done' 0; throw 'No update could be built.' }
+
+    Step 'Installing'
+    $wasRunning = Stop-ChickenWM
+    $release = Join-Path $CacheDir 'release'
+    foreach ($item in $built) {
+        foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
+        $installedCommits[$item.Repo] = $latest[$item.Repo]
+        Report $item.Repo 'installed'
+    }
+    Save-InstalledInfo @($info.components) $installedCommits
+    Say "Updated: $(($built | ForEach-Object { $_.Title }) -join ', ')" 'Green'
+    Report 'done' $built.Count
+    if ($wasRunning) { Start-Process (Join-Path $InstallDir 'chickenwm-rooster.exe') -WorkingDirectory $InstallDir }
 }
 
 # Written next to the programs; Settings > Apps > ChickenWM runs it.
@@ -311,8 +423,13 @@ Write-Host 'ChickenWM is uninstalled. Your settings are kept in %USERPROFILE%\.c
 '@
 
 try {
-    Install-ChickenWM
+    if ($env:CHICKENWM_UPDATE) {
+        Update-ChickenWM ($env:CHICKENWM_UPDATE -eq 'check')
+    } else {
+        Install-ChickenWM
+    }
 } catch {
     Write-Host ''
-    Write-Host "Install failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+    Report 'error' $_.Exception.Message
 }
