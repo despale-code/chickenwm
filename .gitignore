@@ -27,6 +27,11 @@ desktop.ini
 
 # Personal notes
 /new-todo.txt
+/Todo.md
+/todo.md
+/latesttodo.md
+/continue.txt
+/docs/todo-archive/
 
 # Release packages (scripts/release.ps1)
 /dist/
