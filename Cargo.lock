@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "chickenctl"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-binds"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-files"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-launcher"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-notify"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-paper"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-rooster"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-settings"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-shot"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "chickenwm-wm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -2302,7 +2302,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "henbrowser"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
@@ -3090,7 +3090,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4062,7 +4062,7 @@ dependencies = [
 
 [[package]]
 name = "roobar"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chickenwm-core",
