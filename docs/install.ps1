@@ -14,6 +14,7 @@
 #   $env:CHICKENWM_DIR = "D:\Apps\ChickenWM"                   install somewhere else
 #   $env:CHICKENWM_UPDATE = "1"                                update: rebuild only the programs whose
 #                                                              repository changed (or "check": just list them)
+#   $env:CHICKENWM_JOBS = "3"                                  number of parallel builds (default: auto 2-3)
 # Updating: update.ps1 next to this file, `chickenctl update`, or Settings > General > Updates.
 # Uninstall: Settings > Apps > ChickenWM, or run `uninstall.ps1` in the install folder.
 
@@ -200,20 +201,160 @@ function Remove-SharedBuildCache {
     }
 }
 
-function Build-Component($item, $srcRoot, $commit) {
-    $env:CARGO_TARGET_DIR = Join-Path $CacheDir $item.Repo
+function Show-ProgressBar($current, $total, $activeTitles) {
+    if ($total -le 0) { return }
+    $pct = [Math]::Min(1.0, [Math]::Max(0.0, ($current / $total)))
+    $percent = [int][Math]::Round($pct * 100)
+
+    $activeStr = if ($activeTitles -and $activeTitles.Count -gt 0) { "Building: $($activeTitles -join ', ')" } else { "Done" }
+
+    Write-Progress -Activity "Building ChickenWM ($current/$total)" `
+                   -Status $activeStr `
+                   -PercentComplete $percent
+}
+
+function Prepare-Component($item, $srcRoot, $commit) {
     $zip = Join-Path $srcRoot "$($item.Repo).zip"
-    # A known commit is built exactly (so installed.json can say what is installed).
     $url = if ($commit) { "https://github.com/$Org/$($item.Repo)/archive/$commit.zip" } else { "https://github.com/$Org/$($item.Repo)/archive/refs/heads/main.zip" }
-    Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
+
+    $attempts = 0
+    while ($attempts -lt 2) {
+        $attempts++
+        try {
+            Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
+            break
+        } catch {
+            if ($attempts -ge 2) { throw $_ }
+            Start-Sleep -Seconds 1
+        }
+    }
+
     $dest = Join-Path $srcRoot $item.Repo
-    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue }
     Expand-Archive $zip -DestinationPath $dest -Force
     $manifest = Get-ChildItem $dest -Filter Cargo.toml -Recurse -Depth 1 | Select-Object -First 1
     if (-not $manifest) { throw "$($item.Repo): no Cargo.toml in the download" }
-    $tc = $script:Toolchain
-    & $script:Cargo @tc build --release --quiet --manifest-path $manifest.FullName
-    if ($LASTEXITCODE -ne 0) { throw "$($item.Repo) failed to build (see the errors above)" }
+    return $manifest.FullName
+}
+
+function Build-Components($itemList, $commitsMap, $srcRoot, [bool]$allowPartial = $false) {
+    if (-not $itemList -or $itemList.Count -eq 0) { return @() }
+
+    $cores = [Environment]::ProcessorCount
+    $defaultJobs = if ($cores -ge 12) { 3 } elseif ($cores -ge 4) { 2 } else { 1 }
+    $concurrency = if ($env:CHICKENWM_JOBS) { [int]$env:CHICKENWM_JOBS } else { $defaultJobs }
+    if ($concurrency -lt 1) { $concurrency = 1 }
+
+    $total = $itemList.Count
+    Say "Building $total program(s) (up to $concurrency in parallel)" 'Cyan'
+
+    $queue = [System.Collections.Queue]::new()
+    foreach ($item in $itemList) { $queue.Enqueue($item) }
+
+    $active = @{}
+    $built = @()
+    $failed = @()
+
+    $origPref = $ProgressPreference
+    $script:ProgressPreference = 'Continue'
+
+    try {
+        while ($queue.Count -gt 0 -or $active.Count -gt 0) {
+            while ($active.Count -lt $concurrency -and $queue.Count -gt 0) {
+                $item = $queue.Dequeue()
+                $repo = $item.Repo
+                Report $repo 'building'
+
+                $manifestPath = $null
+                try {
+                    $commit = $commitsMap[$repo]
+                    $manifestPath = Prepare-Component $item $srcRoot $commit
+                } catch {
+                    Say "  [FAIL] $($item.Title): $($_.Exception.Message)" 'Red'
+                    Report $repo 'failed' $_.Exception.Message
+                    $failed += $item
+                    continue
+                }
+
+                $logPath = Join-Path $srcRoot "$repo.build.log"
+                $targetDir = Join-Path $CacheDir $repo
+                $tcArgs = if ($script:Toolchain -and $script:Toolchain.Count -gt 0) { "$($script:Toolchain -join ' ') " } else { "" }
+
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName = 'cmd.exe'
+                $psi.Arguments = "/c `"`"$script:Cargo`" ${tcArgs}build --release --manifest-path `"$manifestPath`" > `"$logPath`" 2>&1`""
+                $psi.EnvironmentVariables["CARGO_TARGET_DIR"] = $targetDir
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+
+                try {
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    $active[$repo] = @{
+                        Item = $item
+                        Process = $proc
+                        LogPath = $logPath
+                    }
+                    Say ("  --> Started: {0}" -f $item.Title) 'DarkGray'
+                } catch {
+                    Say "  [FAIL] Couldn't start Cargo for $($item.Title): $($_.Exception.Message)" 'Red'
+                    Report $repo 'failed' $_.Exception.Message
+                    $failed += $item
+                }
+            }
+
+            $activeTitles = @($active.Values | ForEach-Object { $_.Item.Title })
+            Show-ProgressBar ($built.Count + $failed.Count) $total $activeTitles
+
+            $exitedKeys = @()
+            foreach ($key in $active.Keys) {
+                $entry = $active[$key]
+                if ($entry.Process.HasExited) {
+                    $exitedKeys += $key
+                    $code = $entry.Process.ExitCode
+                    $item = $entry.Item
+                    if ($code -eq 0) {
+                        $built += $item
+                        Report $item.Repo 'built'
+                        $completedCount = $built.Count + $failed.Count
+                        Say ("  [OK] {0,-24} ({1}/{2})" -f $item.Title, $completedCount, $total) 'Green'
+                        if (Test-Path $entry.LogPath) { Remove-Item $entry.LogPath -Force -ErrorAction SilentlyContinue }
+                    } else {
+                        $failed += $item
+                        $errMsg = if (Test-Path $entry.LogPath) {
+                            $lines = Get-Content $entry.LogPath
+                            $tail = if ($lines.Count -gt 10) { $lines[-10..-1] } else { $lines }
+                            ($tail | Where-Object { $_ }) -join "`n    "
+                        } else { "Exit code $code" }
+                        Say ("  [FAIL] {0}:" -f $item.Title) 'Red'
+                        if ($errMsg) { Say "    $errMsg" 'DarkRed' }
+                        Report $item.Repo 'failed' "exit code $code"
+                    }
+                }
+            }
+            foreach ($k in $exitedKeys) { $active.Remove($k) }
+
+            if ($active.Count -gt 0 -or $queue.Count -gt 0) {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+
+        Show-ProgressBar ($built.Count + $failed.Count) $total @()
+        Write-Progress -Activity "Building ChickenWM" -Completed
+    } finally {
+        $script:ProgressPreference = $origPref
+        foreach ($entry in $active.Values) {
+            if ($entry.Process -and -not $entry.Process.HasExited) {
+                try { $entry.Process.Kill() } catch {}
+            }
+        }
+    }
+
+    if (-not $allowPartial -and $failed.Count -gt 0) {
+        $failedNames = ($failed | ForEach-Object { $_.Title }) -join ', '
+        throw "Failed to build: $failedNames"
+    }
+
+    return $built
 }
 
 # --- Installing -------------------------------------------------------------------------------
@@ -251,18 +392,15 @@ function Install-ChickenWM {
     New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
     Remove-SharedBuildCache
     $commits = @{}
-    $n = 0
     foreach ($item in $items) {
-        $n++
-        Say ("[{0}/{1}] {2}" -f $n, $items.Count, $item.Title) 'White'
         $commits[$item.Repo] = Get-LatestCommit $item.Repo
-        Build-Component $item $srcRoot $commits[$item.Repo]
     }
+    $built = Build-Components $items $commits $srcRoot -allowPartial $false
 
     Step 'Installing'
     $wasRunning = Stop-ChickenWM
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
-    foreach ($item in $items) {
+    foreach ($item in $built) {
         $release = Get-ComponentRelease $item
         foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
     }
@@ -371,20 +509,8 @@ function Update-ChickenWM([bool]$checkOnly) {
     $srcRoot = Join-Path $env:TEMP 'chickenwm-install'
     New-Item -ItemType Directory -Force $srcRoot, $CacheDir | Out-Null
     Remove-SharedBuildCache
-    Step "Updating $($pending.Count) program(s), one by one"
-    $built = @()
-    foreach ($item in $pending) {
-        Say "  $($item.Title)" 'White'
-        Report $item.Repo 'building'
-        try {
-            Build-Component $item $srcRoot $latest[$item.Repo]
-            Report $item.Repo 'built'
-            $built += $item
-        } catch {
-            Say "    failed: $($_.Exception.Message)" 'Red'
-            Report $item.Repo 'failed' $_.Exception.Message
-        }
-    }
+    Step "Updating $($pending.Count) program(s)"
+    $built = Build-Components $pending $latest $srcRoot -allowPartial $true
     if (-not $built.Count) { Report 'done' 0; throw 'No update could be built.' }
 
     Step 'Installing'
