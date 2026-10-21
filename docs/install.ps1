@@ -1,6 +1,6 @@
 # ChickenWM installer.
 #
-#   irm https://despale-code.github.io/chickenwm/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/despale-code/chickenwm/main/docs/install.ps1 | iex
 #
 # Downloads the source of each ChickenWM program from GitHub, builds it with Cargo and installs it
 # for the current user (no administrator rights): programs in %LOCALAPPDATA%\Programs\ChickenWM,
