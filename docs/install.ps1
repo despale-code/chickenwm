@@ -359,6 +359,25 @@ function Build-Components($itemList, $commitsMap, $srcRoot, [bool]$allowPartial 
 
 # --- Installing -------------------------------------------------------------------------------
 
+function Install-Component-Files($item) {
+    $release = Get-ComponentRelease $item
+    foreach ($file in $item.Files) {
+        $src = Join-Path $release $file
+        if (-not (Test-Path $src)) {
+            $found = Get-ChildItem (Join-Path $release 'build') -Filter $file -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+            if ($found) { $src = $found.FullName }
+        }
+        if (Test-Path $src) {
+            Copy-Item $src $InstallDir -Force
+        } elseif ($file -eq 'WebView2Loader.dll' -and (Test-Path (Join-Path $InstallDir $file))) {
+            # Already present in installation folder, keep existing
+        } else {
+            throw "Missing build artifact: $src"
+        }
+    }
+}
+
 function New-Shortcut($path, $target, $description) {
     $shell = New-Object -ComObject WScript.Shell
     $lnk = $shell.CreateShortcut($path)
@@ -401,8 +420,7 @@ function Install-ChickenWM {
     $wasRunning = Stop-ChickenWM
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
     foreach ($item in $built) {
-        $release = Get-ComponentRelease $item
-        foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
+        Install-Component-Files $item
     }
 
     # Programs that were installed before but are now unticked.
@@ -516,8 +534,7 @@ function Update-ChickenWM([bool]$checkOnly) {
     Step 'Installing'
     $wasRunning = Stop-ChickenWM
     foreach ($item in $built) {
-        $release = Get-ComponentRelease $item
-        foreach ($file in $item.Files) { Copy-Item (Join-Path $release $file) $InstallDir -Force }
+        Install-Component-Files $item
         $installedCommits[$item.Repo] = $latest[$item.Repo]
         Report $item.Repo 'installed'
     }
