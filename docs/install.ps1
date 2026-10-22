@@ -231,7 +231,9 @@ function Prepare-Component($item, $srcRoot, $commit) {
 
     $dest = Join-Path $srcRoot $item.Repo
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue }
+    Unblock-File $zip -ErrorAction SilentlyContinue
     Expand-Archive $zip -DestinationPath $dest -Force
+    Get-ChildItem -Path $dest -Recurse -Force -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
     $manifest = Get-ChildItem $dest -Filter Cargo.toml -Recurse -Depth 1 | Select-Object -First 1
     if (-not $manifest) { throw "$($item.Repo): no Cargo.toml in the download" }
     return $manifest.FullName
@@ -422,6 +424,19 @@ function Install-ChickenWM {
     foreach ($item in $built) {
         Install-Component-Files $item
     }
+
+    # Remove Mark of the Web and sign binaries to satisfy Smart App Control
+    Get-ChildItem -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+    try {
+        $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq "CN=ChickenWM" } | Select-Object -First 1
+        if (-not $cert) {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=ChickenWM" -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter (Get-Date).AddYears(10)
+        }
+        if ($cert) {
+            Get-ChildItem -Path $InstallDir -Filter "*.exe" | ForEach-Object { Set-AuthenticodeSignature -FilePath $_.FullName -Certificate $cert | Out-Null }
+            Get-ChildItem -Path $InstallDir -Filter "*.dll" | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -eq "NotSigned" } | ForEach-Object { Set-AuthenticodeSignature -FilePath $_.FullName -Certificate $cert | Out-Null }
+        }
+    } catch {}
 
     # Programs that were installed before but are now unticked.
     foreach ($item in $Catalog | Where-Object { -not $chosen[$_.Repo] }) {
