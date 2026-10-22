@@ -22,7 +22,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $Org = 'despale-code'
-$Version = '0.2.0'
+$Version = '0.2.1'
 
 # Every program: repository, files it installs, Start Menu shortcut (if any), whether it is
 # required, and whether it is picked by default.
