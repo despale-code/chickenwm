@@ -16,7 +16,7 @@
    • Zero-copy GPU Texture Bridge (WGC)        • 100% Raw Hardware Input (Anti-Cheat Safe)
    • Decoupled Quad Animation Engine           • G-Sync / FreeSync & HDR Native
    • NO Drivers Required (100% Anti-Cheat Safe)• In-Game Transparent Vulkan HUD Overlay
-   • UAC as Standard Window (No Dimming Locks) • Zero Compositor GPU Overhead
+   • Custom DPMS Sleep & Lock Screen           • Zero Compositor GPU Overhead
 ```
 
 ---
@@ -46,19 +46,46 @@
 - **Mechanism**: Win32 Keyed Mutex (`IDXGIKeyedMutex`) or Shared Fences (`ID3D11Fence` / `VkSemaphore` via `VK_KHR_external_semaphore_win32`).
 - WGC signals on new frame arrival &rarr; Vulkan acquires mutex &rarr; Fragment shader renders &rarr; Vulkan releases mutex. Prevents tearing, micro-stutter, and GPU driver crashes.
 
-### 2.4 Decoupled Quad Animation Engine
-In standard Windows, window moving/resizing stutters because apps synchronously handle `WM_WINDOWPOSCHANGING` and redraws. In `coop`, visual animations are **100% decoupled** from Win32:
+### 2.4 Decoupled Quad Animation Engine & Resizing
 - **Visuals in Vulkan**: The window quad animates at the monitor's native refresh rate (144Hz, 240Hz, 360Hz) with zero stutter.
 - **Spring-Damper Physics**: Custom Hooke's Law simulations in Rust drive natural momentum, organic bounce, and rubber-banding.
 - **Wobbly / Jelly Windows**: 16x16 vertex mesh displacement calculated directly in a Vulkan vertex shader.
-- **3D Workspace Transitions**: True 3D perspective rotations, depth of field, and carousel/cube transitions.
+- **Interactive Live Resizing**: Instead of ugly raw stretching or waiting for slow apps (Electron/VS Code) to re-render, `coop` applies dynamic elastic stretch shaders and smooth spring curves during resize drag, snapping to the final native resolution cleanly once the drag settles.
 - **Lazy Alignment**: When the animation settles, `coop` issues a single, silent Win32 `SetWindowPos` to snap the real window underneath for physical hit-testing.
 
-### 2.5 Hardware Mouse Cursor Strategy
-- **No Software Cursor**: We do **not** draw the cursor in Vulkan shaders to avoid the 1–2 frame (16ms) floaty input lag.
-- **Hardware Cursor Plane**: We utilize the GPU's native Win32 hardware cursor plane. `coop` reads the hovered window's cursor shape (`WM_SETCURSOR` / `GetCursorInfo`) and calls `SetCursor()` to update the hardware plane directly (1000Hz+ polling, zero lag).
+### 2.5 Multi-Monitor & Framerate Strategy
+- Default to the highest available display refresh rate (e.g. 240Hz) with configurable overrides in `chickenwm.conf`.
+- Each physical monitor operates an independent Vulkan swapchain to guarantee mixed-refresh-rate setups (e.g. 60Hz secondary + 240Hz primary) never throttle the high-speed display.
 
-### 2.6 UAC & The Secure Desktop
+### 2.6 Hardware Mouse Cursor & High-Polling Mice (1000Hz–8000Hz)
+- **Hardware Cursor Plane**: We utilize the GPU's native Win32 hardware cursor plane (`WM_SETCURSOR` / `SetCursor`) for 1000Hz+ instantaneous cursor response (no 16ms software shader lag).
+- **High-Polling Decoupling**: For 1000Hz–8000Hz gaming mice, cursor movement coordinates are stored in atomic variables. Window hit-testing is evaluated at the display frame rate (144Hz–240Hz), preventing CPU core saturation.
+
+### 2.7 Premultiplied Alpha Blending
+- WGC textures output premultiplied alpha.
+- Vulkan blend state is explicitly configured:
+  ```rust
+  src_color_blend_factor = vk::BlendFactor::ONE;
+  dst_color_blend_factor = vk::BlendFactor::ONE_MINUS_SRC_ALPHA;
+  ```
+- Guarantees translucent window edges, drop shadows, and popup dialogs blend with zero dark/black halos.
+
+### 2.8 Stealing Windows Sleep, Lock & Hangs
+Instead of relying on Windows native lock screens and sleep timeouts:
+- **Steal `Win + L`**: Disable Windows kernel lock workstation via registry:
+  ```ini
+  [HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System]
+  "DisableLockWorkstation"=dword:00000001
+  ```
+  `chickenwm-binds` now intercepts `Win + L` directly.
+- **Custom DPMS Sleep**: When idle or requested, `coop` shuts down monitor signal directly via Win32 DPMS:
+  ```rust
+  SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2); // Power off displays
+  ```
+- **Instant Wake on Input**: Low-level hooks listen for any mouse motion or keypress, instantly waking displays (`SC_MONITORPOWER, -1`) and restoring the Vulkan viewspace without Windows lock screen delays.
+- **Custom Lock Screen**: ChickenWM renders its own custom aesthetic lock screen directly in Vulkan (PAM/Windows credentials auth or simple PIN/password).
+
+### 2.9 UAC & Elevation as Standard Windows
 - Running `coop` as Administrator is rejected: it breaks UIPI, prevents drag-and-drop, and creates security risks.
 - **The Solution**: Set Windows Registry policy:
   ```ini
@@ -67,19 +94,16 @@ In standard Windows, window moving/resizing stutters because apps synchronously 
   ```
 - **Result**: UAC prompts spawn as standard Win32 windows on the `Default` desktop. `coop` captures and composites the elevation dialog like any other window with full blur shaders and zero black screen locks.
 
-### 2.7 Popups, Menus & File Pickers
+### 2.10 Popups, Menus & File Pickers
 - Win32 menus (`#32768`), dropdowns, tooltips, and file dialogs spawn as independent `WS_POPUP` windows at raw screen coordinates.
 - **Hierarchy Tracker**:
   - Hooks `EVENT_OBJECT_CREATE` and `EVENT_SYSTEM_MENUPOPUPSTART`.
   - Resolves root parent via `GetAncestor(hwnd, GA_ROOTOWNER)`.
   - Attaches popup texture as a relative floating sub-quad above the parent window in the Vulkan scene.
 
-### 2.8 Text Sharpness & DPI Scaling
-- Windows on the virtual layout are rendered at 150%–200% DPI.
-- `coop`'s Vulkan sampling shader uses high-order reconstruction (Bicubic / Catmull-Rom filtering) for clean downsampling.
-
-### 2.9 DRM / Protected Media Decision
-- **Status**: Deferred. Hardware-protected media surfaces (Widevine L1 / PlayReady) outputting black rectangles under WGC will be handled later, or granted direct passthrough. All standard desktop content renders without restriction.
+### 2.11 Built-in Shader Wallpaper & Alt-Tab Exposé
+- **Native Vulkan Wallpaper**: `coop` renders wallpapers directly as the bottom-most Vulkan layer. Supports high-res static images, animated video loops, and interactive GLSL/Vulkan compute shaders (Shadertoy/Lively style) at zero extra process cost.
+- **Exposé / Alt-Tab**: Native 3D window switcher rendering all open window quads in a fluid bird's-eye view.
 
 ---
 
