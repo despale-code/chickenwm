@@ -48,8 +48,8 @@ impl SpringPhysics {
             position: initial,
             target: initial,
             velocity: Vec2::default(),
-            stiffness: 380.0,
-            damping: 34.0,
+            stiffness: 520.0,
+            damping: 36.0,
             speed: 2.2,
         }
     }

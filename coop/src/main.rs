@@ -165,9 +165,9 @@ async fn main() -> Result<()> {
     let _hierarchy = HierarchyTracker::start();
     let _power_hook = PowerManager::start_hook();
 
-    let mut anim_speed = chickenwm_core::config::load_or_init_config()
-        .map(|(_doc, c)| c.animations.speed)
-        .unwrap_or(2.2);
+    let initial_cfg = chickenwm_core::config::load_or_init_config().map(|(_doc, c)| c).ok();
+    let mut anim_speed = initial_cfg.as_ref().map(|c| c.animations.speed).unwrap_or(2.2);
+    let config_fps_limit = initial_cfg.as_ref().map(|c| c.misc.fps_limit).unwrap_or(0);
     let mut last_cfg_check = Instant::now();
 
     let mut wallpaper = WallpaperLayer::new();
@@ -177,9 +177,15 @@ async fn main() -> Result<()> {
     let mut z_ordered_keys: Vec<isize> = Vec::new();
     let mut last_enum = Instant::now() - Duration::from_secs(1);
 
-    let frame_interval = Duration::from_micros((1_000_000 / max_hz.max(60)) as u64);
-    let mut last_tick = Instant::now();
+    let pacer = chickenwm_core::frame_scheduler::FramePacerControl::new(config_fps_limit, false);
+    pacer.set_monitor_native_hz(max_hz);
+    let mut scheduler = chickenwm_core::frame_scheduler::AdaptiveFrameScheduler::new(pacer);
+    let mut dt = 1.0 / (max_hz.max(60) as f32);
+
     let idle_timeout_ms = 15 * 60 * 1000; // 15 min DPMS sleep timeout
+
+    let mut fps_report = Instant::now();
+    let mut frame_count = 0u32;
 
     tracing::info!(
         "coop running across {} monitor(s) at up to {}Hz",
@@ -205,13 +211,11 @@ async fn main() -> Result<()> {
             || DISPLAY_SLEEPING.load(Ordering::Acquire)
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            last_tick = Instant::now();
+            dt = scheduler.sample_delta_seconds();
             continue;
         }
 
         let now = Instant::now();
-        let dt = (now - last_tick).as_secs_f32();
-        last_tick = now;
 
         // Refresh window list and Z-order every ~32ms, and update positions every frame
         if last_enum.elapsed() >= Duration::from_millis(32) {
@@ -299,6 +303,9 @@ async fn main() -> Result<()> {
                     for entry in managed_windows.values_mut() {
                         entry.quad.set_speed(anim_speed);
                     }
+                }
+                if new_cfg.misc.fps_limit != scheduler.control().fps_limit() {
+                    scheduler.control().set_fps_limit(Some(new_cfg.misc.fps_limit));
                 }
             }
         }
@@ -464,10 +471,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        let elapsed = last_tick.elapsed();
-        if elapsed < frame_interval {
-            tokio::time::sleep(frame_interval - elapsed).await;
+        frame_count += 1;
+        if fps_report.elapsed() >= Duration::from_secs(1) {
+            let elapsed_secs = fps_report.elapsed().as_secs_f32();
+            let measured_fps = (frame_count as f32 / elapsed_secs).round() as u32;
+            let target_fps = scheduler.control().effective_target_fps();
+            tracing::info!("coop: {} FPS (target: {}Hz)", measured_fps, target_fps);
+            frame_count = 0;
+            fps_report = Instant::now();
         }
+
+        dt = scheduler.wait_for_next_frame_timer(true);
     }
 
     if let Some(ref ctx) = vk_ctx {
