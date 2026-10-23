@@ -12,7 +12,9 @@ use coop::input::{
 use coop::power::{PowerManager, DISPLAY_SLEEPING, SESSION_LOCKED};
 use coop::scene::hierarchy::HierarchyTracker;
 use coop::scene::{Vec2, WindowQuad};
-use coop::vulkan::pipeline::{CompositorPipeline, ExposeOverview, WallpaperLayer};
+use coop::vulkan::pipeline::{
+    CompositorPipeline, ExposeOverview, MacBorderColors, MacBorderTheme, WallpaperLayer,
+};
 use coop::vulkan::swapchain::{enumerate_physical_monitors, MonitorSwapchain};
 use coop::vulkan::{ImportedVulkanTexture, VulkanContext};
 use std::collections::{HashMap, HashSet};
@@ -193,12 +195,11 @@ async fn main() -> Result<()> {
     let initial_cfg = chickenwm_core::config::load_or_init_config().map(|(_doc, c)| c).ok();
     let mut anim_speed = initial_cfg.as_ref().map(|c| c.animations.speed).unwrap_or(2.2);
     let config_fps_limit = initial_cfg.as_ref().map(|c| c.misc.fps_limit).unwrap_or(0);
-    let mut corner_radius = initial_cfg.as_ref().map(|c| c.decoration.rounding).unwrap_or(6);
-    let mut border_thickness = initial_cfg.as_ref().map(|c| c.general.border_size).unwrap_or(2);
-    let mut border_color = initial_cfg.as_ref().map(|c| {
-        let p = c.general.col_active_border.primary;
-        [p.r as f32 / 255.0, p.g as f32 / 255.0, p.b as f32 / 255.0, p.a as f32 / 255.0]
-    }).unwrap_or([0.04, 0.52, 1.0, 1.0]);
+    let mut corner_radius = initial_cfg.as_ref().map(|c| c.decoration.rounding).unwrap_or(12);
+    let mut theme_mode = initial_cfg
+        .as_ref()
+        .map(|c| if c.theme.mode == chickenwm_core::theme::ThemeMode::Light { MacBorderTheme::Light } else { MacBorderTheme::Dark })
+        .unwrap_or(MacBorderTheme::Dark);
     let mut last_cfg_check = Instant::now();
 
     let mut wallpaper = WallpaperLayer::new();
@@ -339,9 +340,7 @@ async fn main() -> Result<()> {
                     scheduler.control().set_fps_limit(Some(new_cfg.misc.fps_limit));
                 }
                 corner_radius = new_cfg.decoration.rounding;
-                border_thickness = new_cfg.general.border_size;
-                let p = new_cfg.general.col_active_border.primary;
-                border_color = [p.r as f32 / 255.0, p.g as f32 / 255.0, p.b as f32 / 255.0, p.a as f32 / 255.0];
+                theme_mode = if new_cfg.theme.mode == chickenwm_core::theme::ThemeMode::Light { MacBorderTheme::Light } else { MacBorderTheme::Dark };
             }
         }
 
@@ -466,7 +465,8 @@ async fn main() -> Result<()> {
                                 420.0,
                                 180.0,
                             );
-                            pipeline.record_quad_border(
+                            let lock_colors = MacBorderColors::for_state(theme_mode, true);
+                            pipeline.record_mac_dual_rim_border(
                                 device,
                                 cmd_buf,
                                 &lock_quad,
@@ -474,43 +474,67 @@ async fn main() -> Result<()> {
                                 mon_y,
                                 mon_w,
                                 mon_h,
-                                [0.95, 0.45, 0.15, 1.0],
-                                4,
+                                lock_colors,
                                 corner_radius,
                             );
-                        } else if let Some(fg_entry) = managed_windows.get(&(fg_hwnd.0 as isize)) {
+                        } else {
                             let shell_hwnd = unsafe { GetShellWindow() };
-                            if fg_hwnd != shell_hwnd {
-                                pipeline.record_quad_border(
-                                    device,
-                                    cmd_buf,
-                                    &fg_entry.quad,
-                                    mon_x,
-                                    mon_y,
-                                    mon_w,
-                                    mon_h,
-                                    border_color,
-                                    border_thickness,
-                                    corner_radius,
-                                );
+                            let unfocused_colors = MacBorderColors::for_state(theme_mode, false);
+                            let focused_colors = MacBorderColors::for_state(theme_mode, true);
 
-                                for popup in &active_popups {
-                                    let pquad = HierarchyTracker::compute_relative_popup_quad(
-                                        popup,
-                                        &fg_entry.quad,
-                                    );
-                                    pipeline.record_quad_border(
+                            // macOS Shadowless Dual-Rim: unfocused border on inactive visible windows
+                            for key in &z_ordered_keys {
+                                if *key != (fg_hwnd.0 as isize) && *key != (shell_hwnd.0 as isize) {
+                                    if let Some(entry) = managed_windows.get(key) {
+                                        if entry.capture.has_frame {
+                                            pipeline.record_mac_dual_rim_border(
+                                                device,
+                                                cmd_buf,
+                                                &entry.quad,
+                                                mon_x,
+                                                mon_y,
+                                                mon_w,
+                                                mon_h,
+                                                unfocused_colors,
+                                                corner_radius,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            // macOS Shadowless Dual-Rim: focused border on active window
+                            if let Some(fg_entry) = managed_windows.get(&(fg_hwnd.0 as isize)) {
+                                if fg_hwnd != shell_hwnd {
+                                    pipeline.record_mac_dual_rim_border(
                                         device,
                                         cmd_buf,
-                                        &pquad,
+                                        &fg_entry.quad,
                                         mon_x,
                                         mon_y,
                                         mon_w,
                                         mon_h,
-                                        border_color,
-                                        border_thickness.min(2),
-                                        corner_radius.min(4),
+                                        focused_colors,
+                                        corner_radius,
                                     );
+
+                                    for popup in &active_popups {
+                                        let pquad = HierarchyTracker::compute_relative_popup_quad(
+                                            popup,
+                                            &fg_entry.quad,
+                                        );
+                                        pipeline.record_mac_dual_rim_border(
+                                            device,
+                                            cmd_buf,
+                                            &pquad,
+                                            mon_x,
+                                            mon_y,
+                                            mon_w,
+                                            mon_h,
+                                            focused_colors,
+                                            corner_radius.min(8),
+                                        );
+                                    }
                                 }
                             }
                         }
