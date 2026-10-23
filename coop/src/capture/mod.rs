@@ -12,18 +12,19 @@ use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIKeyedMutex, IDXGIResource1};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIResource1};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::System::WinRT::RoGetActivationFactory;
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::System::WinRT::{RoGetActivationFactory, RoInitialize, RO_INIT_MULTITHREADED};
+use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
 /// Shared D3D11 device context used across WGC capture sessions.
 pub struct CaptureDevice {
@@ -35,6 +36,8 @@ pub struct CaptureDevice {
 impl CaptureDevice {
     pub fn new() -> Result<Self> {
         unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
+
             let feature_levels = [D3D_FEATURE_LEVEL_11_0];
             let mut d3d_device: Option<ID3D11Device> = None;
             let mut d3d_context: Option<ID3D11DeviceContext> = None;
@@ -66,13 +69,13 @@ impl CaptureDevice {
         }
     }
 
-    /// Allocates a `B8G8R8A8_UNORM` texture configured with `SHARED_NTHANDLE | SHARED_KEYEDMUTEX`
-    /// and exports its NT `HANDLE` via `IDXGIResource1::CreateSharedHandle`.
+    /// Allocates a `B8G8R8A8_UNORM` texture configured with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`
+    /// and exports its NT `HANDLE` via `IDXGIResource1::CreateSharedHandle` for Vulkan import.
     pub fn create_shared_texture(
         &self,
         width: u32,
         height: u32,
-    ) -> Result<(ID3D11Texture2D, IDXGIKeyedMutex, HANDLE)> {
+    ) -> Result<(ID3D11Texture2D, HANDLE)> {
         unsafe {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width.max(1),
@@ -87,8 +90,8 @@ impl CaptureDevice {
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
                 CPUAccessFlags: 0,
-                MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
-                    | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
+                MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
+                    as u32,
             };
 
             let mut texture: Option<ID3D11Texture2D> = None;
@@ -102,8 +105,7 @@ impl CaptureDevice {
                 .CreateSharedHandle(None, GENERIC_ALL.0, None)
                 .context("IDXGIResource1::CreateSharedHandle failed")?;
 
-            let keyed_mutex: IDXGIKeyedMutex = texture.cast()?;
-            Ok((texture, keyed_mutex, nt_handle))
+            Ok((texture, nt_handle))
         }
     }
 }
@@ -126,18 +128,17 @@ pub struct WindowCaptureSession {
     pub hwnd: HWND,
     pub shared_handle: HANDLE,
     pub shared_texture: Option<ID3D11Texture2D>,
-    pub keyed_mutex: Option<IDXGIKeyedMutex>,
     pub frame_pool: Option<Direct3D11CaptureFramePool>,
     pub session: Option<GraphicsCaptureSession>,
     pub width: u32,
     pub height: u32,
     pub paused: bool,
+    pub has_frame: bool,
+    pub handle_recreated: bool,
 }
 
 impl WindowCaptureSession {
     /// Starts capturing a Win32 `HWND` using `Windows.Graphics.Capture`.
-    /// Configures `IsBorderRequired = false` and `IsCursorCaptureEnabled = false`,
-    /// and exports an NT shared `HANDLE` for Vulkan external memory import.
     pub fn start(hwnd: HWND) -> Result<Self> {
         let dev = CaptureDevice::new()?;
         Self::start_with_device(hwnd, &dev)
@@ -147,24 +148,29 @@ impl WindowCaptureSession {
     pub fn start_with_device(hwnd: HWND, dev: &CaptureDevice) -> Result<Self> {
         let mut rc = RECT::default();
         unsafe {
-            let _ = GetClientRect(hwnd, &mut rc);
+            let _ = GetWindowRect(hwnd, &mut rc);
         }
         let width = (rc.right - rc.left).max(1) as u32;
         let height = (rc.bottom - rc.top).max(1) as u32;
-
-        let (shared_tex, keyed_mutex, shared_handle) = dev.create_shared_texture(width, height)?;
 
         let item = create_capture_item_for_hwnd(hwnd)?;
         let item_size = item.Size().unwrap_or(SizeInt32 {
             Width: width as i32,
             Height: height as i32,
         });
+        let w = item_size.Width.max(1) as u32;
+        let h = item_size.Height.max(1) as u32;
+
+        let (shared_tex, shared_handle) = dev.create_shared_texture(w, h)?;
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &dev.winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
-            item_size,
+            SizeInt32 {
+                Width: w as i32,
+                Height: h as i32,
+            },
         )
         .context("Direct3D11CaptureFramePool::CreateFreeThreaded failed")?;
 
@@ -172,7 +178,6 @@ impl WindowCaptureSession {
             .CreateCaptureSession(&item)
             .context("CreateCaptureSession failed")?;
 
-        // Phase 2.1: Disable yellow capture border and OS cursor baking into texture
         let _ = session.SetIsBorderRequired(false);
         let _ = session.SetIsCursorCaptureEnabled(false);
         session.StartCapture().context("StartCapture failed")?;
@@ -181,18 +186,17 @@ impl WindowCaptureSession {
             hwnd,
             shared_handle,
             shared_texture: Some(shared_tex),
-            keyed_mutex: Some(keyed_mutex),
             frame_pool: Some(frame_pool),
             session: Some(session),
-            width: item_size.Width.max(1) as u32,
-            height: item_size.Height.max(1) as u32,
+            width: w,
+            height: h,
             paused: false,
+            has_frame: false,
+            handle_recreated: false,
         })
     }
 
-    /// Polls the next captured WGC frame and copies it into the shared NT-handle texture
-    /// under `IDXGIKeyedMutex` synchronization. Returns `Ok(true)` if a new frame was latched,
-    /// and updates `width`/`height` dynamically if the window resized.
+    /// Drains the frame pool to grab the newest WGC frame and copies it into the shared NT-handle texture.
     pub fn poll_next_frame(&mut self, dev: &CaptureDevice) -> Result<bool> {
         if self.paused {
             return Ok(false);
@@ -200,7 +204,12 @@ impl WindowCaptureSession {
         let Some(pool) = &self.frame_pool else {
             return Ok(false);
         };
-        let Ok(frame) = pool.TryGetNextFrame() else {
+
+        let mut latest_frame = None;
+        while let Ok(frame) = pool.TryGetNextFrame() {
+            latest_frame = Some(frame);
+        }
+        let Some(frame) = latest_frame else {
             return Ok(false);
         };
 
@@ -216,13 +225,34 @@ impl WindowCaptureSession {
         let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
         unsafe {
             let src_tex: ID3D11Texture2D = access.GetInterface()?;
-            if let (Some(dst_tex), Some(mutex)) = (&self.shared_texture, &self.keyed_mutex) {
-                if mutex.AcquireSync(0, 5).is_ok() {
-                    let dst_res: ID3D11Resource = dst_tex.cast()?;
-                    let src_res: ID3D11Resource = src_tex.cast()?;
-                    dev.d3d_context.CopyResource(&dst_res, &src_res);
-                    let _ = mutex.ReleaseSync(0);
-                }
+            let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+            src_tex.GetDesc(&mut src_desc);
+
+            if let Some(dst_tex) = &self.shared_texture {
+                let copy_w = self.width.min(src_desc.Width).max(1);
+                let copy_h = self.height.min(src_desc.Height).max(1);
+                let src_box = D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: copy_w,
+                    bottom: copy_h,
+                    back: 1,
+                };
+                let dst_res: ID3D11Resource = dst_tex.cast()?;
+                let src_res: ID3D11Resource = src_tex.cast()?;
+                dev.d3d_context.CopySubresourceRegion(
+                    &dst_res,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &src_res,
+                    0,
+                    Some(&src_box),
+                );
+                dev.d3d_context.Flush();
+                self.has_frame = true;
             }
         }
         Ok(true)
@@ -248,12 +278,12 @@ impl WindowCaptureSession {
                 let _ = CloseHandle(self.shared_handle);
             }
         }
-        let (tex, mutex, handle) = dev.create_shared_texture(w, h)?;
+        let (tex, handle) = dev.create_shared_texture(w, h)?;
         self.shared_texture = Some(tex);
-        self.keyed_mutex = Some(mutex);
         self.shared_handle = handle;
         self.width = w;
         self.height = h;
+        self.handle_recreated = true;
         Ok(())
     }
 
@@ -271,7 +301,6 @@ impl WindowCaptureSession {
             let _ = pool.Close();
         }
         self.shared_texture = None;
-        self.keyed_mutex = None;
         if !self.shared_handle.is_invalid() && !self.shared_handle.0.is_null() {
             unsafe {
                 let _ = CloseHandle(self.shared_handle);

@@ -39,6 +39,7 @@ pub struct SpringPhysics {
     pub velocity: Vec2,
     pub stiffness: f32,
     pub damping: f32,
+    pub speed: f32,
 }
 
 impl SpringPhysics {
@@ -47,14 +48,15 @@ impl SpringPhysics {
             position: initial,
             target: initial,
             velocity: Vec2::default(),
-            stiffness: 170.0,
-            damping: 26.0,
+            stiffness: 380.0,
+            damping: 34.0,
+            speed: 2.2,
         }
     }
 
-    /// Advances the simulation by `dt` seconds using semi-implicit Euler integration.
+    /// Advances the simulation by `dt` seconds using semi-implicit Euler integration scaled by `speed`.
     pub fn step(&mut self, dt: f32) {
-        let dt = dt.clamp(0.0, 0.05);
+        let dt = (dt * self.speed).clamp(0.0, 0.05);
         let force_x =
             -self.stiffness * (self.position.x - self.target.x) - self.damping * self.velocity.x;
         let force_y =
@@ -114,6 +116,12 @@ impl WindowQuad {
             hit_box_dirty: false,
             last_win32_resize: Instant::now(),
         }
+    }
+
+    /// Sets the master animation speed multiplier for position and size springs.
+    pub fn set_speed(&mut self, speed: f32) {
+        self.physics.speed = speed;
+        self.size_physics.speed = speed;
     }
 
     /// Sets a new animated target position and marks the Win32 physical hit-box for lazy sync on rest.

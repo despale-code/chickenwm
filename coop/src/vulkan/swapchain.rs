@@ -210,15 +210,15 @@ impl MonitorSwapchain {
                 .create_win32_surface(&surface_info, None)
                 .context("vkCreateWin32SurfaceKHR failed")?;
 
-            // Create RenderPass supporting premultiplied alpha clear and present
+            // Create RenderPass that preserves blitted window textures (LOAD) and transitions to PRESENT_SRC_KHR
             let attachment = [vk::AttachmentDescription::default()
                 .format(vk::Format::B8G8R8A8_UNORM)
                 .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .initial_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
 
             let color_ref = [vk::AttachmentReference::default()
@@ -402,15 +402,18 @@ impl MonitorSwapchain {
         Ok(())
     }
 
-    /// Acquires the next swapchain image, records the render pass (clearing to `clear_rgba` and invoking
-    /// `record_draws`), submits to the graphics queue, and presents to the display.
-    pub fn render_and_present<F>(
+    /// Acquires the next swapchain image, transitions it to `TRANSFER_DST_OPTIMAL`, clears to `clear_rgba`,
+    /// invokes `record_blits` to blit captured window textures, then runs the render pass (`record_draws`)
+    /// for borders/HUD and presents to the display.
+    pub fn render_and_present<B, F>(
         &mut self,
         ctx: &VulkanContext,
         clear_rgba: [f32; 4],
+        record_blits: B,
         record_draws: F,
     ) -> Result<()>
     where
+        B: FnOnce(vk::CommandBuffer, vk::Image),
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
         if self.swapchain == vk::SwapchainKHR::null() {
@@ -448,11 +451,50 @@ impl MonitorSwapchain {
             ctx.device
                 .begin_command_buffer(self.command_buffer, &begin_info)?;
 
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: clear_rgba,
-                },
-            }];
+            let dst_image = self.images[image_index as usize];
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+
+            // 1. Transition swapchain image UNDEFINED -> TRANSFER_DST_OPTIMAL
+            let to_transfer_dst = [vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .image(dst_image)
+                .subresource_range(subresource)];
+
+            ctx.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_transfer_dst,
+            );
+
+            // 2. Clear background (dark slate desktop or lock screen backdrop)
+            let clear_color = vk::ClearColorValue {
+                float32: clear_rgba,
+            };
+            ctx.device.cmd_clear_color_image(
+                self.command_buffer,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_color,
+                &[subresource],
+            );
+
+            // 3. Blit all captured WGC window textures (and wallpaper) in back-to-front Z-order
+            record_blits(self.command_buffer, dst_image);
+
+            // 4. Begin RenderPass (preserves blitted images via LOAD) to draw borders & HUD accents
             let rp_begin = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
                 .framebuffer(self.framebuffers[image_index as usize])
@@ -462,8 +504,7 @@ impl MonitorSwapchain {
                         width: self.width,
                         height: self.height,
                     },
-                })
-                .clear_values(&clear_values);
+                });
 
             ctx.device.cmd_begin_render_pass(
                 self.command_buffer,

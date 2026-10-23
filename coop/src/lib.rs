@@ -100,4 +100,20 @@ mod tests {
         assert!(w0 > 800.0 && h0 > 400.0);
         assert!(x3 > x0 && y3 > y0);
     }
+
+    #[test]
+    fn test_live_d3d11_to_vulkan_nt_handle_import() {
+        let cdev = crate::capture::CaptureDevice::new().expect("CaptureDevice::new failed");
+        let (_tex, handle) = cdev
+            .create_shared_texture(256, 256)
+            .expect("create_shared_texture failed");
+        let vk_ctx = crate::vulkan::VulkanContext::new().expect("VulkanContext::new failed");
+        let mut imported = vk_ctx
+            .import_dxgi_texture(handle, 256, 256)
+            .expect("import_dxgi_texture failed");
+        unsafe {
+            imported.destroy(&vk_ctx.device);
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+    }
 }
