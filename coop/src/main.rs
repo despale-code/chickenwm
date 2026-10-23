@@ -193,6 +193,12 @@ async fn main() -> Result<()> {
     let initial_cfg = chickenwm_core::config::load_or_init_config().map(|(_doc, c)| c).ok();
     let mut anim_speed = initial_cfg.as_ref().map(|c| c.animations.speed).unwrap_or(2.2);
     let config_fps_limit = initial_cfg.as_ref().map(|c| c.misc.fps_limit).unwrap_or(0);
+    let mut corner_radius = initial_cfg.as_ref().map(|c| c.decoration.rounding).unwrap_or(6);
+    let mut border_thickness = initial_cfg.as_ref().map(|c| c.general.border_size).unwrap_or(2);
+    let mut border_color = initial_cfg.as_ref().map(|c| {
+        let p = c.general.col_active_border.primary;
+        [p.r as f32 / 255.0, p.g as f32 / 255.0, p.b as f32 / 255.0, p.a as f32 / 255.0]
+    }).unwrap_or([0.04, 0.52, 1.0, 1.0]);
     let mut last_cfg_check = Instant::now();
 
     let mut wallpaper = WallpaperLayer::new();
@@ -332,6 +338,10 @@ async fn main() -> Result<()> {
                 if new_cfg.misc.fps_limit != scheduler.control().fps_limit() {
                     scheduler.control().set_fps_limit(Some(new_cfg.misc.fps_limit));
                 }
+                corner_radius = new_cfg.decoration.rounding;
+                border_thickness = new_cfg.general.border_size;
+                let p = new_cfg.general.col_active_border.primary;
+                border_color = [p.r as f32 / 255.0, p.g as f32 / 255.0, p.b as f32 / 255.0, p.a as f32 / 255.0];
             }
         }
 
@@ -466,6 +476,7 @@ async fn main() -> Result<()> {
                                 mon_h,
                                 [0.95, 0.45, 0.15, 1.0],
                                 4,
+                                corner_radius,
                             );
                         } else if let Some(fg_entry) = managed_windows.get(&(fg_hwnd.0 as isize)) {
                             let shell_hwnd = unsafe { GetShellWindow() };
@@ -478,8 +489,9 @@ async fn main() -> Result<()> {
                                     mon_y,
                                     mon_w,
                                     mon_h,
-                                    [0.95, 0.45, 0.15, 0.95],
-                                    3,
+                                    border_color,
+                                    border_thickness,
+                                    corner_radius,
                                 );
 
                                 for popup in &active_popups {
@@ -495,8 +507,9 @@ async fn main() -> Result<()> {
                                         mon_y,
                                         mon_w,
                                         mon_h,
-                                        [0.98, 0.68, 0.25, 0.90],
-                                        2,
+                                        border_color,
+                                        border_thickness.min(2),
+                                        corner_radius.min(4),
                                     );
                                 }
                             }

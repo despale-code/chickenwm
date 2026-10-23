@@ -106,7 +106,7 @@ impl CompositorPipeline {
     }
 
     /// Records a crisp animated GPU border frame around a `WindowQuad` inside an active render pass
-    /// using `vkCmdClearAttachments`, providing visual spring-damper feedback at 240Hz+.
+    /// using `vkCmdClearAttachments`, with exact circular fillet corner arcs based on `radius`.
     pub fn record_quad_border(
         &self,
         device: &ash::Device,
@@ -118,12 +118,14 @@ impl CompositorPipeline {
         mon_h: u32,
         rgba: [f32; 4],
         thickness: i32,
+        radius: i32,
     ) {
         let local_x = (quad.physics.position.x.round() as i32) - mon_x;
         let local_y = (quad.physics.position.y.round() as i32) - mon_y;
         let w = quad.width.round() as i32;
         let h = quad.height.round() as i32;
-        let t = thickness.max(2);
+        let t = thickness.max(1);
+        let r = radius.clamp(0, (w / 2).min(h / 2));
 
         let clamp_rect = |rx: i32, ry: i32, rw: i32, rh: i32| -> Option<vk::ClearRect> {
             let x0 = rx.clamp(0, mon_w as i32);
@@ -147,19 +149,80 @@ impl CompositorPipeline {
             }
         };
 
-        let mut rects = Vec::with_capacity(4);
-        // Top, Bottom, Left, Right border strips
-        if let Some(r) = clamp_rect(local_x - t, local_y - t, w + 2 * t, t) {
-            rects.push(r);
-        }
-        if let Some(r) = clamp_rect(local_x - t, local_y + h, w + 2 * t, t) {
-            rects.push(r);
-        }
-        if let Some(r) = clamp_rect(local_x - t, local_y, t, h) {
-            rects.push(r);
-        }
-        if let Some(r) = clamp_rect(local_x + w, local_y, t, h) {
-            rects.push(r);
+        let mut rects = Vec::with_capacity(40);
+
+        if r <= 1 {
+            // Flat rectangular border strips
+            if let Some(rect) = clamp_rect(local_x - t, local_y - t, w + 2 * t, t) {
+                rects.push(rect);
+            }
+            if let Some(rect) = clamp_rect(local_x - t, local_y + h, w + 2 * t, t) {
+                rects.push(rect);
+            }
+            if let Some(rect) = clamp_rect(local_x - t, local_y, t, h) {
+                rects.push(rect);
+            }
+            if let Some(rect) = clamp_rect(local_x + w, local_y, t, h) {
+                rects.push(rect);
+            }
+        } else {
+            // 1. Straight edge segments between rounded corners
+            if w > 2 * r {
+                if let Some(rect) = clamp_rect(local_x + r, local_y - t, w - 2 * r, t) {
+                    rects.push(rect);
+                }
+                if let Some(rect) = clamp_rect(local_x + r, local_y + h, w - 2 * r, t) {
+                    rects.push(rect);
+                }
+            }
+            if h > 2 * r {
+                if let Some(rect) = clamp_rect(local_x - t, local_y + r, t, h - 2 * r) {
+                    rects.push(rect);
+                }
+                if let Some(rect) = clamp_rect(local_x + w, local_y + r, t, h - 2 * r) {
+                    rects.push(rect);
+                }
+            }
+
+            // 2. Discretized circular arc fillet corners
+            let cx_left = local_x + r;
+            let cx_right = local_x + w - r;
+            let cy_top = local_y + r;
+            let cy_bottom = local_y + h - r;
+
+            let r_outer = (r + t) as f32;
+            let r_inner = r as f32;
+            let total_rows = r + t;
+
+            for row in 0..total_rows {
+                let dy = (total_rows - 1 - row) as f32 + 0.5;
+                if dy < r_outer {
+                    let dx_outer = (r_outer * r_outer - dy * dy).sqrt().round() as i32;
+                    let dx_inner = if dy < r_inner {
+                        (r_inner * r_inner - dy * dy).sqrt().round() as i32
+                    } else {
+                        0
+                    };
+                    let span_w = (dx_outer - dx_inner).max(1);
+
+                    // Top-Left corner
+                    if let Some(rect) = clamp_rect(cx_left - dx_outer, cy_top - total_rows + row, span_w, 1) {
+                        rects.push(rect);
+                    }
+                    // Top-Right corner
+                    if let Some(rect) = clamp_rect(cx_right + dx_inner, cy_top - total_rows + row, span_w, 1) {
+                        rects.push(rect);
+                    }
+                    // Bottom-Left corner
+                    if let Some(rect) = clamp_rect(cx_left - dx_outer, cy_bottom + (total_rows - 1 - row), span_w, 1) {
+                        rects.push(rect);
+                    }
+                    // Bottom-Right corner
+                    if let Some(rect) = clamp_rect(cx_right + dx_inner, cy_bottom + (total_rows - 1 - row), span_w, 1) {
+                        rects.push(rect);
+                    }
+                }
+            }
         }
 
         if rects.is_empty() {
