@@ -105,6 +105,11 @@ Instead of relying on Windows native lock screens and sleep timeouts:
 - **Native Vulkan Wallpaper**: `coop` renders wallpapers directly as the bottom-most Vulkan layer. Supports high-res static images, animated video loops, and interactive GLSL/Vulkan compute shaders (Shadertoy/Lively style) at zero extra process cost.
 - **Exposé / Alt-Tab**: Native 3D window switcher rendering all open window quads in a fluid bird's-eye view.
 
+### 2.12 Scope Boundaries & Input Notes
+- **Language / IME Scope**: Focused strictly on the English language and Latin keyboard layouts. Complex IME composition overlays (Asian scripts / `TextInputHost.exe`) are explicitly out-of-scope for the initial target.
+- **Cursor Clipping (`ClipCursor`)**: Games and specialized creative applications that trap or confine the mouse within window bounds function natively because foreground focus is maintained on the target application during active input.
+- **Audio & Media Chords**: Volume (`VK_VOLUME_UP/DOWN/MUTE`) and playback controls interface with Windows Core Audio via WASAPI `IAudioEndpointVolume`, surfaced through `roobar` and `chickenwm-notify`.
+
 ---
 
 ## 3. `chickenscope`: Low-Latency Game Mode & Overlay
