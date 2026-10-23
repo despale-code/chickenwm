@@ -6,6 +6,7 @@
 # Local AI-agent / editor configuration (not part of the project)
 /.claude/
 /.mcp.json
+/opencode.json
 /CLAUDE.md
 /AGENTS.md
 /.ragpilot/

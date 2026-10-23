@@ -18,6 +18,8 @@ members = [
     "chickenctl",
     "henbrowser",
     "chickenwm-shot",
+    "coop",
+    "chickenscope",
 ]
 
 [patch."https://github.com/despale-code/chickenwm-core"]
