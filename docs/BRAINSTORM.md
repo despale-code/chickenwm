@@ -12,19 +12,27 @@
                ┌──────────────────────┴──────────────────────┐
                ▼                                             ▼
      [ Desktop Mode: coop ]                      [ Game Mode: chickenscope ]
-   • Vulkan 2D/3D Viewspace Canvas             • Native DirectFlip Scanout (0ms lag)
-   • Zero-copy GPU Texture Bridge              • 100% Raw Hardware Input (Anti-Cheat Safe)
-   • Custom Shaders, Blurs, Fluid Transforms   • G-Sync / FreeSync & HDR Native
-   • Win32 Virtual Display (IDD) Parking       • Transparent In-Game Vulkan HUD Overlay
+   • Pure User-Mode Vulkan Compositor          • Native DirectFlip Scanout (0ms lag)
+   • Zero-copy GPU Texture Bridge (WGC)        • 100% Raw Hardware Input (Anti-Cheat Safe)
+   • Decoupled Quad Animation Engine           • G-Sync / FreeSync & HDR Native
+   • NO Drivers Required (100% Anti-Cheat Safe)• In-Game Transparent Vulkan HUD Overlay
+   • UAC as Standard Window (No Dimming Locks) • Zero Compositor GPU Overhead
 ```
 
 ---
 
-## 2. `coop`: Vulkan Viewspace Compositor
+## 2. `coop`: Pure User-Mode Vulkan Viewspace Compositor
 
 `coop` replaces DWM's presentation layer for desktop productivity apps, hosting windows on a freeform GPU canvas.
 
-### 2.1 Surface Capture & Zero-Copy GPU Bridge
+### 2.1 The "Zero-Driver" Breakthrough
+- **No Custom Drivers Needed**: We avoid Indirect Display Drivers (IDD) and kernel drivers entirely.
+  - No Microsoft WHQL driver certification or expensive EV certificates needed ($0 cost).
+  - No `testsigning` required &rarr; **100% compatible with Secure Boot and kernel anti-cheats (CS2, Valorant/Vanguard, Fortnite/EAC, BattlEye)**.
+  - Zero risk of Blue Screens of Death (BSOD); crashes are pure user-mode process panics caught by `chickenwm-rooster`.
+- **Window Positioning Strategy**: Real Win32 windows exist directly on the physical monitor, sized and placed silently **behind** `coop`'s top-most transparent Vulkan window. Because they reside on an active physical display, Windows renders them at full GPU acceleration (144Hz–240Hz+) without sleep throttling.
+
+### 2.2 Surface Capture & Zero-Copy GPU Bridge
 - **Capture Source**: `Windows.Graphics.Capture` (WGC) API targetting app `HWND`s.
   - Flags: `IsBorderRequired = false` (strips yellow privacy box), `IsCursorCaptureEnabled = false`.
 - **Zero-Copy VRAM Handoff**:
@@ -33,33 +41,45 @@
   - Vulkan imports the shared handle directly into a `VkImage` using `VK_KHR_external_memory_win32`.
   - **Zero CPU copying and zero RAM transfers**: Texture remains in VRAM throughout.
 
-### 2.2 Cross-API Synchronization
+### 2.3 Cross-API Synchronization
 - Direct3D 11/12 and Vulkan access the shared texture concurrently.
 - **Mechanism**: Win32 Keyed Mutex (`IDXGIKeyedMutex`) or Shared Fences (`ID3D11Fence` / `VkSemaphore` via `VK_KHR_external_semaphore_win32`).
 - WGC signals on new frame arrival &rarr; Vulkan acquires mutex &rarr; Fragment shader renders &rarr; Vulkan releases mutex. Prevents tearing, micro-stutter, and GPU driver crashes.
 
-### 2.3 Window Off-Screen Parking (The IDD Pattern)
-- **Problem**: Minimized, cloaked (`DWMWA_CLOAK`), or far off-screen (`-32000, -32000`) windows are throttled by Windows to 0 FPS.
-- **Solution**: A lightweight headless **Indirect Display Driver (IDD)** creating a virtual high-resolution monitor (e.g. 4K/8K virtual display).
-  - Real Win32 windows exist at native resolution on the virtual display.
-  - Windows OS renders them at full GPU acceleration.
-  - `coop` captures their frames and projects them onto the physical monitor in Vulkan.
+### 2.4 Decoupled Quad Animation Engine
+In standard Windows, window moving/resizing stutters because apps synchronously handle `WM_WINDOWPOSCHANGING` and redraws. In `coop`, visual animations are **100% decoupled** from Win32:
+- **Visuals in Vulkan**: The window quad animates at the monitor's native refresh rate (144Hz, 240Hz, 360Hz) with zero stutter.
+- **Spring-Damper Physics**: Custom Hooke's Law simulations in Rust drive natural momentum, organic bounce, and rubber-banding.
+- **Wobbly / Jelly Windows**: 16x16 vertex mesh displacement calculated directly in a Vulkan vertex shader.
+- **3D Workspace Transitions**: True 3D perspective rotations, depth of field, and carousel/cube transitions.
+- **Lazy Alignment**: When the animation settles, `coop` issues a single, silent Win32 `SetWindowPos` to snap the real window underneath for physical hit-testing.
 
-### 2.4 Popups, Context Menus & File Pickers
+### 2.5 Hardware Mouse Cursor Strategy
+- **No Software Cursor**: We do **not** draw the cursor in Vulkan shaders to avoid the 1–2 frame (16ms) floaty input lag.
+- **Hardware Cursor Plane**: We utilize the GPU's native Win32 hardware cursor plane. `coop` reads the hovered window's cursor shape (`WM_SETCURSOR` / `GetCursorInfo`) and calls `SetCursor()` to update the hardware plane directly (1000Hz+ polling, zero lag).
+
+### 2.6 UAC & The Secure Desktop
+- Running `coop` as Administrator is rejected: it breaks UIPI, prevents drag-and-drop, and creates security risks.
+- **The Solution**: Set Windows Registry policy:
+  ```ini
+  [HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System]
+  "PromptOnSecureDesktop"=dword:00000000
+  ```
+- **Result**: UAC prompts spawn as standard Win32 windows on the `Default` desktop. `coop` captures and composites the elevation dialog like any other window with full blur shaders and zero black screen locks.
+
+### 2.7 Popups, Menus & File Pickers
 - Win32 menus (`#32768`), dropdowns, tooltips, and file dialogs spawn as independent `WS_POPUP` windows at raw screen coordinates.
 - **Hierarchy Tracker**:
   - Hooks `EVENT_OBJECT_CREATE` and `EVENT_SYSTEM_MENUPOPUPSTART`.
   - Resolves root parent via `GetAncestor(hwnd, GA_ROOTOWNER)`.
   - Attaches popup texture as a relative floating sub-quad above the parent window in the Vulkan scene.
 
-### 2.5 Text Sharpness & DPI Scaling
-- Subpixel ClearType degrades if scaled arbitrarily on a fractional grid.
-- Windows on the virtual display are rendered at 150%–200% DPI.
+### 2.8 Text Sharpness & DPI Scaling
+- Windows on the virtual layout are rendered at 150%–200% DPI.
 - `coop`'s Vulkan sampling shader uses high-order reconstruction (Bicubic / Catmull-Rom filtering) for clean downsampling.
 
-### 2.6 Occlusion & Resource Culling
-- Only windows on the active workspace inside the viewport retain active capture sessions.
-- Inactive/occluded workspaces drop to static texture caches or throttled 1 FPS capture.
+### 2.9 DRM / Protected Media Decision
+- **Status**: Deferred. Hardware-protected media surfaces (Widevine L1 / PlayReady) outputting black rectangles under WGC will be handled later, or granted direct passthrough. All standard desktop content renders without restriction.
 
 ---
 
@@ -68,7 +88,7 @@
 `chickenscope` handles games by completely bypassing the compositor layer, eliminating anti-cheat collisions, input lag, and frame pacing issues.
 
 ### 3.1 Why Games Must Bypass Compositing
-1. **Kernel Anti-Cheat (Vanguard, EAC, BattlEye, Ricochet)**:
+1. **Kernel Anti-Cheat (Vanguard, EAC, BattlEye, FACEIT)**:
    - Synthetic input injection (`SendInput`, `PostMessage`) is flagged as botting/macroing.
    - Games demand unadulterated OS hardware input packets.
 2. **Raw Input & 3D Camera Controls**:
@@ -136,5 +156,5 @@ Shell = "%LOCALAPPDATA%\Programs\ChickenWM\chickenwm-rooster.exe"
 | **Idle Process Count** | 160 – 220 processes | **65 – 85 processes** |
 | **Idle Memory Footprint** | 3.5 GB – 4.5 GB | **1.4 GB – 1.8 GB** |
 | **Gaming Input Latency** | DWM composition buffer (~8-16ms) | **0 ms added (Hardware DirectFlip)** |
-| **Game Anti-Cheat Status** | Native | **100% Compliant (Zero synthetic input)** |
-| **Desktop Visual Freedom** | Restricted to DWM window frames | **Unrestricted (Custom shaders, 3D viewspaces)** |
+| **Game Anti-Cheat Status** | Native | **100% Compliant (Zero drivers, zero synthetic input)** |
+| **Desktop Visual Freedom** | Restricted to DWM window frames | **Unrestricted (Vulkan shaders, spring physics, 3D viewspaces)** |
