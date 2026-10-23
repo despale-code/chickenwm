@@ -1,6 +1,7 @@
 //! Phase 3.2, 3.3 & 3.5: Premultiplied alpha blending pipeline, Catmull-Rom bicubic filter,
-//! vertex deformation push constants, and Wallpaper / Exposé layer state.
+//! vertex deformation push constants, Wallpaper / Exposé layer state, and GPU quad/border command recording.
 
+use crate::scene::WindowQuad;
 use anyhow::Result;
 use ash::vk;
 
@@ -67,7 +68,7 @@ pub fn premultiplied_alpha_blend_attachment() -> vk::PipelineColorBlendAttachmen
         .color_write_mask(vk::ColorComponentFlags::RGBA)
 }
 
-/// Configures Vulkan pipeline states for compositing window quads.
+/// Configures Vulkan pipeline states for compositing window quads and GPU border accents.
 pub struct CompositorPipeline {
     pub blend_attachment: vk::PipelineColorBlendAttachmentState,
     pub layout: vk::PipelineLayout,
@@ -102,6 +103,80 @@ impl CompositorPipeline {
             self.layout = device.create_pipeline_layout(&layout_info, None)?;
         }
         Ok(())
+    }
+
+    /// Records a crisp animated GPU border frame around a `WindowQuad` inside an active render pass
+    /// using `vkCmdClearAttachments`, providing visual spring-damper feedback at 240Hz+.
+    pub fn record_quad_border(
+        &self,
+        device: &ash::Device,
+        cmd_buf: vk::CommandBuffer,
+        quad: &WindowQuad,
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        rgba: [f32; 4],
+        thickness: i32,
+    ) {
+        let local_x = (quad.physics.position.x.round() as i32) - mon_x;
+        let local_y = (quad.physics.position.y.round() as i32) - mon_y;
+        let w = quad.width.round() as i32;
+        let h = quad.height.round() as i32;
+        let t = thickness.max(2);
+
+        let clamp_rect = |rx: i32, ry: i32, rw: i32, rh: i32| -> Option<vk::ClearRect> {
+            let x0 = rx.clamp(0, mon_w as i32);
+            let y0 = ry.clamp(0, mon_h as i32);
+            let x1 = (rx + rw).clamp(0, mon_w as i32);
+            let y1 = (ry + rh).clamp(0, mon_h as i32);
+            if x1 > x0 && y1 > y0 {
+                Some(vk::ClearRect {
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D { x: x0, y: y0 },
+                        extent: vk::Extent2D {
+                            width: (x1 - x0) as u32,
+                            height: (y1 - y0) as u32,
+                        },
+                    },
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+            } else {
+                None
+            }
+        };
+
+        let mut rects = Vec::with_capacity(4);
+        // Top, Bottom, Left, Right border strips
+        if let Some(r) = clamp_rect(local_x - t, local_y - t, w + 2 * t, t) {
+            rects.push(r);
+        }
+        if let Some(r) = clamp_rect(local_x - t, local_y + h, w + 2 * t, t) {
+            rects.push(r);
+        }
+        if let Some(r) = clamp_rect(local_x - t, local_y, t, h) {
+            rects.push(r);
+        }
+        if let Some(r) = clamp_rect(local_x + w, local_y, t, h) {
+            rects.push(r);
+        }
+
+        if rects.is_empty() {
+            return;
+        }
+
+        let clear_att = [vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            color_attachment: 0,
+            clear_value: vk::ClearValue {
+                color: vk::ClearColorValue { float32: rgba },
+            },
+        }];
+
+        unsafe {
+            device.cmd_clear_attachments(cmd_buf, &clear_att, &rects);
+        }
     }
 }
 

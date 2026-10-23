@@ -1,19 +1,24 @@
-//! Phase 3.1: Display enumeration and independent per-monitor Vulkan swapchains for native max refresh rates.
+//! Phase 3.1: Display enumeration, click-through transparent top-most window creation,
+//! and independent per-monitor Vulkan swapchains + render/present loop at native max refresh rates.
 
 use crate::vulkan::VulkanContext;
 use anyhow::{Context, Result};
 use ash::vk;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW, ENUM_CURRENT_SETTINGS,
     HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow,
-    HWND_BOTTOM, HWND_TOPMOST, SWP_NOACTIVATE, SW_SHOWNA, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetLayeredWindowAttributes,
+    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, HTTRANSPARENT, HWND_BOTTOM, HWND_TOPMOST,
+    LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE,
+    WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 /// Metadata for a physical display enumerated via `EnumDisplayMonitors`.
@@ -91,10 +96,15 @@ unsafe extern "system" fn coop_canvas_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_NCHITTEST {
+        return LRESULT(HTTRANSPARENT as isize);
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// Spawns a borderless, topmost `WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP` Vulkan host window covering a monitor.
+/// Spawns a borderless, click-through, per-pixel alpha transparent Vulkan host window covering a monitor.
+/// Configured with `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` and `WDA_EXCLUDEFROMCAPTURE`
+/// so mouse clicks pass straight through to underlying apps and WGC never captures the canvas itself.
 pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> {
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
@@ -109,7 +119,11 @@ pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> 
         let _ = RegisterClassW(&wc);
 
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+            WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW
+                | WS_EX_LAYERED
+                | WS_EX_TRANSPARENT
+                | WS_EX_NOACTIVATE,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(class_name.as_ptr()),
             WS_POPUP | WS_VISIBLE,
@@ -122,12 +136,23 @@ pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> 
             HINSTANCE(hinstance.0),
             None,
         )?;
+
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let _ = chickenwm_core::sys::set_overlay_capture_exclusion(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWNA);
         Ok(hwnd)
     }
 }
 
-/// Encapsulates a dedicated Vulkan window, surface, and swapchain bound to a specific physical monitor.
+/// Encapsulates a dedicated Vulkan window, surface, swapchain, render pass, and command buffers for a monitor.
 pub struct MonitorSwapchain {
     pub monitor: HMONITOR,
     pub hwnd: HWND,
@@ -136,8 +161,15 @@ pub struct MonitorSwapchain {
     pub refresh_rate_hz: u32,
     pub surface: vk::SurfaceKHR,
     pub swapchain: vk::SwapchainKHR,
+    pub render_pass: vk::RenderPass,
     pub images: Vec<vk::Image>,
     pub views: Vec<vk::ImageView>,
+    pub framebuffers: Vec<vk::Framebuffer>,
+    pub command_pool: vk::CommandPool,
+    pub command_buffer: vk::CommandBuffer,
+    pub image_available_sem: vk::Semaphore,
+    pub render_finished_sem: vk::Semaphore,
+    pub in_flight_fence: vk::Fence,
 }
 
 impl MonitorSwapchain {
@@ -151,23 +183,75 @@ impl MonitorSwapchain {
             refresh_rate_hz,
             surface: vk::SurfaceKHR::null(),
             swapchain: vk::SwapchainKHR::null(),
+            render_pass: vk::RenderPass::null(),
             images: Vec::new(),
             views: Vec::new(),
+            framebuffers: Vec::new(),
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            image_available_sem: vk::Semaphore::null(),
+            render_finished_sem: vk::Semaphore::null(),
+            in_flight_fence: vk::Fence::null(),
         })
     }
 
-    /// Initializes the Win32 top-most canvas window, `VkSurfaceKHR`, and `VkSwapchainKHR` for the display.
+    /// Initializes the Win32 top-most canvas window, `VkSurfaceKHR`, `VkRenderPass`, `VkSwapchainKHR`,
+    /// framebuffers, command buffer, and sync primitives for the display.
     pub fn new_with_vulkan(ctx: &VulkanContext, info: &PhysicalMonitorInfo) -> Result<Self> {
         let hwnd = create_monitor_canvas_window(info)?;
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
-            let win32_surface_fn = ash::khr::win32_surface::Instance::new(&ctx.entry, &ctx.instance);
+            let win32_surface_fn =
+                ash::khr::win32_surface::Instance::new(&ctx.entry, &ctx.instance);
             let surface_info = vk::Win32SurfaceCreateInfoKHR::default()
                 .hinstance(hinstance.0 as isize)
                 .hwnd(hwnd.0 as isize);
             let surface = win32_surface_fn
                 .create_win32_surface(&surface_info, None)
                 .context("vkCreateWin32SurfaceKHR failed")?;
+
+            // Create RenderPass supporting premultiplied alpha clear and present
+            let attachment = [vk::AttachmentDescription::default()
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+
+            let color_ref = [vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_ref)];
+
+            let rp_info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachment)
+                .subpasses(&subpass);
+            let render_pass = ctx.device.create_render_pass(&rp_info, None)?;
+
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(ctx.graphics_queue_family)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let command_pool = ctx.device.create_command_pool(&pool_info, None)?;
+
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let command_buffer = ctx.device.allocate_command_buffers(&alloc_info)?[0];
+
+            let sem_info = vk::SemaphoreCreateInfo::default();
+            let image_available_sem = ctx.device.create_semaphore(&sem_info, None)?;
+            let render_finished_sem = ctx.device.create_semaphore(&sem_info, None)?;
+
+            let fence_info =
+                vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+            let in_flight_fence = ctx.device.create_fence(&fence_info, None)?;
 
             let mut sc = Self {
                 monitor: info.handle,
@@ -177,8 +261,15 @@ impl MonitorSwapchain {
                 refresh_rate_hz: info.refresh_rate_hz,
                 surface,
                 swapchain: vk::SwapchainKHR::null(),
+                render_pass,
                 images: Vec::new(),
                 views: Vec::new(),
+                framebuffers: Vec::new(),
+                command_pool,
+                command_buffer,
+                image_available_sem,
+                render_finished_sem,
+                in_flight_fence,
             };
             sc.recreate_with_vulkan(ctx, info.width, info.height)?;
             Ok(sc)
@@ -192,7 +283,7 @@ impl MonitorSwapchain {
         Ok(())
     }
 
-    /// Recreates the underlying Vulkan swapchain and image views at the target resolution.
+    /// Recreates the underlying Vulkan swapchain, image views, and framebuffers at the target resolution.
     pub fn recreate_with_vulkan(
         &mut self,
         ctx: &VulkanContext,
@@ -204,6 +295,14 @@ impl MonitorSwapchain {
         unsafe {
             ctx.wait_idle();
             let swapchain_fn = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
+            let surface_fn = ash::khr::surface::Instance::new(&ctx.entry, &ctx.instance);
+
+            for &fb in &self.framebuffers {
+                if fb != vk::Framebuffer::null() {
+                    ctx.device.destroy_framebuffer(fb, None);
+                }
+            }
+            self.framebuffers.clear();
 
             for &v in &self.views {
                 if v != vk::ImageView::null() {
@@ -212,10 +311,41 @@ impl MonitorSwapchain {
             }
             self.views.clear();
 
+            let caps = surface_fn
+                .get_physical_device_surface_capabilities(ctx.physical_device, self.surface)?;
+            let composite_alpha = if caps
+                .supported_composite_alpha
+                .contains(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
+            {
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+            } else if caps
+                .supported_composite_alpha
+                .contains(vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED)
+            {
+                vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED
+            } else {
+                vk::CompositeAlphaFlagsKHR::OPAQUE
+            };
+
+            let present_modes = surface_fn
+                .get_physical_device_surface_present_modes(ctx.physical_device, self.surface)?;
+            let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                vk::PresentModeKHR::MAILBOX
+            } else {
+                vk::PresentModeKHR::FIFO
+            };
+
+            let min_images = (caps.min_image_count + 1).max(2);
+            let image_count = if caps.max_image_count > 0 {
+                min_images.min(caps.max_image_count)
+            } else {
+                min_images
+            };
+
             let old_swapchain = self.swapchain;
             let create_info = vk::SwapchainCreateInfoKHR::default()
                 .surface(self.surface)
-                .min_image_count(3)
+                .min_image_count(image_count)
                 .image_format(vk::Format::B8G8R8A8_UNORM)
                 .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
                 .image_extent(vk::Extent2D {
@@ -223,11 +353,13 @@ impl MonitorSwapchain {
                     height: self.height,
                 })
                 .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+                .image_usage(
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                )
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(vk::PresentModeKHR::MAILBOX)
+                .composite_alpha(composite_alpha)
+                .present_mode(present_mode)
                 .clipped(true)
                 .old_swapchain(old_swapchain);
 
@@ -253,8 +385,139 @@ impl MonitorSwapchain {
                         base_array_layer: 0,
                         layer_count: 1,
                     });
-                self.views.push(ctx.device.create_image_view(&view_info, None)?);
+                let view = ctx.device.create_image_view(&view_info, None)?;
+                self.views.push(view);
+
+                let attachments = [view];
+                let fb_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(self.render_pass)
+                    .attachments(&attachments)
+                    .width(self.width)
+                    .height(self.height)
+                    .layers(1);
+                let fb = ctx.device.create_framebuffer(&fb_info, None)?;
+                self.framebuffers.push(fb);
             }
+        }
+        Ok(())
+    }
+
+    /// Acquires the next swapchain image, records the render pass (clearing to `clear_rgba` and invoking
+    /// `record_draws`), submits to the graphics queue, and presents to the display.
+    pub fn render_and_present<F>(
+        &mut self,
+        ctx: &VulkanContext,
+        clear_rgba: [f32; 4],
+        record_draws: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer),
+    {
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return Ok(());
+        }
+        unsafe {
+            let fences = [self.in_flight_fence];
+            ctx.device.wait_for_fences(&fences, true, 100_000_000)?;
+
+            let swapchain_fn = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
+            let acquire = swapchain_fn.acquire_next_image(
+                self.swapchain,
+                100_000_000,
+                self.image_available_sem,
+                vk::Fence::null(),
+            );
+
+            let image_index = match acquire {
+                Ok((idx, _suboptimal)) => idx,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    let w = self.width;
+                    let h = self.height;
+                    self.recreate_with_vulkan(ctx, w, h)?;
+                    return Ok(());
+                }
+                Err(_) => return Ok(()),
+            };
+
+            ctx.device.reset_fences(&fences)?;
+            ctx.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            ctx.device
+                .begin_command_buffer(self.command_buffer, &begin_info)?;
+
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: clear_rgba,
+                },
+            }];
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.framebuffers[image_index as usize])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: self.width,
+                        height: self.height,
+                    },
+                })
+                .clear_values(&clear_values);
+
+            ctx.device.cmd_begin_render_pass(
+                self.command_buffer,
+                &rp_begin,
+                vk::SubpassContents::INLINE,
+            );
+
+            let viewports = [vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.width as f32,
+                height: self.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: self.width,
+                    height: self.height,
+                },
+            }];
+            ctx.device
+                .cmd_set_viewport(self.command_buffer, 0, &viewports);
+            ctx.device
+                .cmd_set_scissor(self.command_buffer, 0, &scissors);
+
+            record_draws(&ctx.device, self.command_buffer);
+
+            ctx.device.cmd_end_render_pass(self.command_buffer);
+            ctx.device.end_command_buffer(self.command_buffer)?;
+
+            let wait_sems = [self.image_available_sem];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let signal_sems = [self.render_finished_sem];
+            let cmd_bufs = [self.command_buffer];
+
+            let submit_info = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cmd_bufs)
+                .signal_semaphores(&signal_sems)];
+
+            ctx.device
+                .queue_submit(ctx.graphics_queue, &submit_info, self.in_flight_fence)?;
+
+            let swapchains = [self.swapchain];
+            let indices = [image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_sems)
+                .swapchains(&swapchains)
+                .image_indices(&indices);
+
+            let _ = swapchain_fn.queue_present(ctx.graphics_queue, &present_info);
         }
         Ok(())
     }
@@ -265,7 +528,11 @@ impl MonitorSwapchain {
             return;
         }
         unsafe {
-            let z = if yield_to_game { HWND_BOTTOM } else { HWND_TOPMOST };
+            let z = if yield_to_game {
+                HWND_BOTTOM
+            } else {
+                HWND_TOPMOST
+            };
             let _ = SetWindowPos(
                 self.hwnd,
                 z,
@@ -273,21 +540,48 @@ impl MonitorSwapchain {
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
             );
         }
     }
 
     pub unsafe fn destroy(&mut self, ctx: &VulkanContext) {
         unsafe {
+            ctx.wait_idle();
             let swapchain_fn = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
             let surface_fn = ash::khr::surface::Instance::new(&ctx.entry, &ctx.instance);
+            for &fb in &self.framebuffers {
+                if fb != vk::Framebuffer::null() {
+                    ctx.device.destroy_framebuffer(fb, None);
+                }
+            }
+            self.framebuffers.clear();
             for &v in &self.views {
                 if v != vk::ImageView::null() {
                     ctx.device.destroy_image_view(v, None);
                 }
             }
             self.views.clear();
+            if self.in_flight_fence != vk::Fence::null() {
+                ctx.device.destroy_fence(self.in_flight_fence, None);
+                self.in_flight_fence = vk::Fence::null();
+            }
+            if self.image_available_sem != vk::Semaphore::null() {
+                ctx.device.destroy_semaphore(self.image_available_sem, None);
+                self.image_available_sem = vk::Semaphore::null();
+            }
+            if self.render_finished_sem != vk::Semaphore::null() {
+                ctx.device.destroy_semaphore(self.render_finished_sem, None);
+                self.render_finished_sem = vk::Semaphore::null();
+            }
+            if self.command_pool != vk::CommandPool::null() {
+                ctx.device.destroy_command_pool(self.command_pool, None);
+                self.command_pool = vk::CommandPool::null();
+            }
+            if self.render_pass != vk::RenderPass::null() {
+                ctx.device.destroy_render_pass(self.render_pass, None);
+                self.render_pass = vk::RenderPass::null();
+            }
             if self.swapchain != vk::SwapchainKHR::null() {
                 swapchain_fn.destroy_swapchain(self.swapchain, None);
                 self.swapchain = vk::SwapchainKHR::null();
