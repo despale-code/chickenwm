@@ -137,7 +137,7 @@ pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> 
             None,
         )?;
 
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 254, LWA_ALPHA);
         let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,

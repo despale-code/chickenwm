@@ -166,7 +166,7 @@ impl WindowCaptureSession {
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &dev.winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            3,
             SizeInt32 {
                 Width: w as i32,
                 Height: h as i32,
@@ -207,7 +207,9 @@ impl WindowCaptureSession {
 
         let mut latest_frame = None;
         while let Ok(frame) = pool.TryGetNextFrame() {
-            latest_frame = Some(frame);
+            if let Some(prev) = latest_frame.replace(frame) {
+                let _ = prev.Close();
+            }
         }
         let Some(frame) = latest_frame else {
             return Ok(false);
@@ -255,6 +257,7 @@ impl WindowCaptureSession {
                 self.has_frame = true;
             }
         }
+        let _ = frame.Close();
         Ok(true)
     }
 
@@ -266,7 +269,7 @@ impl WindowCaptureSession {
             pool.Recreate(
                 &dev.winrt_device,
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                2,
+                3,
                 SizeInt32 {
                     Width: w as i32,
                     Height: h as i32,

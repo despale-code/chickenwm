@@ -19,7 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetShellWindow,
     GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, PeekMessageW, TranslateMessage,
@@ -30,6 +33,31 @@ struct ManagedWindow {
     quad: WindowQuad,
     capture: WindowCaptureSession,
     vk_tex: Option<ImportedVulkanTexture>,
+}
+
+/// Returns the actual visible frame bounds of `hwnd`, excluding invisible Win10/Win11 drop-shadow padding.
+fn get_window_extended_bounds(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        let mut rc = RECT::default();
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rc as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_ok()
+        {
+            if (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0 {
+                return Some(rc);
+            }
+        }
+        if GetWindowRect(hwnd, &mut rc).is_ok() {
+            if (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0 {
+                return Some(rc);
+            }
+        }
+        None
+    }
 }
 
 /// Returns `true` if `hwnd` is cloaked by DWM (e.g. suspended UWP background apps).
@@ -77,8 +105,7 @@ fn enumerate_visible_windows_back_to_front(canvas_hwnds: &[HWND]) -> Vec<(HWND, 
                 return BOOL(1);
             }
 
-            let mut rc = RECT::default();
-            if GetWindowRect(hwnd, &mut rc).is_ok() {
+            if let Some(rc) = get_window_extended_bounds(hwnd) {
                 let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
                 if w > 24 && h > 24 {
@@ -104,12 +131,10 @@ fn enumerate_visible_windows_back_to_front(canvas_hwnds: &[HWND]) -> Vec<(HWND, 
     unsafe {
         let shell_hwnd = GetShellWindow();
         if !shell_hwnd.0.is_null() && IsWindowVisible(shell_hwnd).as_bool() {
-            let mut rc = RECT::default();
-            if GetWindowRect(shell_hwnd, &mut rc).is_ok()
-                && (rc.right - rc.left) > 100
-                && (rc.bottom - rc.top) > 100
-            {
-                top_to_bottom.insert(0, (shell_hwnd, rc));
+            if let Some(rc) = get_window_extended_bounds(shell_hwnd) {
+                if (rc.right - rc.left) > 100 && (rc.bottom - rc.top) > 100 {
+                    top_to_bottom.insert(0, (shell_hwnd, rc));
+                }
             }
         }
     }
@@ -312,15 +337,28 @@ async fn main() -> Result<()> {
 
         // Poll latest WGC frames and step spring-damper physics for all tracked windows
         let fg_hwnd = unsafe { GetForegroundWindow() };
+        let lbutton_down = unsafe {
+            GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
+        };
+
         if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
-            unsafe {
-                let mut rc = RECT::default();
-                if GetWindowRect(fg_hwnd, &mut rc).is_ok() {
-                    fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
-                    fg_entry.quad.size_physics.target = Vec2::new(
-                        (rc.right - rc.left).max(1) as f32,
-                        (rc.bottom - rc.top).max(1) as f32,
-                    );
+            if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
+                let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
+                let target_size = Vec2::new(
+                    (rc.right - rc.left).max(1) as f32,
+                    (rc.bottom - rc.top).max(1) as f32,
+                );
+                fg_entry.quad.physics.target = target_pos;
+                fg_entry.quad.size_physics.target = target_size;
+
+                if lbutton_down {
+                    // Real-time drag: snap directly to target with zero lag/oscillation
+                    fg_entry.quad.physics.position = target_pos;
+                    fg_entry.quad.physics.velocity = Vec2::default();
+                    fg_entry.quad.size_physics.position = target_size;
+                    fg_entry.quad.size_physics.velocity = Vec2::default();
+                    fg_entry.quad.width = target_size.x;
+                    fg_entry.quad.height = target_size.y;
                 }
             }
         }
@@ -348,7 +386,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            entry.quad.step(dt);
+
+            if lbutton_down && entry.quad.hwnd == fg_hwnd {
+                // Keep locked to target position during real-time mouse drag
+                entry.quad.physics.position = entry.quad.physics.target;
+                entry.quad.physics.velocity = Vec2::default();
+                entry.quad.size_physics.position = entry.quad.size_physics.target;
+                entry.quad.size_physics.velocity = Vec2::default();
+                entry.quad.width = entry.quad.size_physics.target.x;
+                entry.quad.height = entry.quad.size_physics.target.y;
+            } else {
+                entry.quad.step(dt);
+            }
         }
 
         // Render and present across all monitor Vulkan swapchains
