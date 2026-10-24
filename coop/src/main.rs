@@ -465,6 +465,15 @@ fn enumerate_visible_windows_back_to_front(canvas_hwnds: &[HWND]) -> Vec<(HWND, 
 #[tokio::main]
 async fn main() -> Result<()> {
     chickenwm_core::init_tracing("coop");
+
+    let _instance = match chickenwm_core::instance::claim_instance("Local\\ChickenWMCoop", 0) {
+        chickenwm_core::instance::Instance::Primary(guard) => guard,
+        chickenwm_core::instance::Instance::Duplicate(_) => {
+            tracing::warn!("Another instance of coop is already running; exiting duplicate.");
+            return Ok(());
+        }
+    };
+
     chickenwm_core::failsafe::install_crash_handler();
     let _failsafe = chickenwm_core::failsafe::spawn_emergency_failsafe_thread();
 
@@ -615,12 +624,15 @@ async fn main() -> Result<()> {
                 let role = classify_window_role(hwnd);
 
                 if let Some(entry) = managed_windows.get_mut(&key) {
-                    entry.native_rect = rc;
-                    if !expose.active
-                        || !matches!(role, WindowRole::Tiled | WindowRole::Floating)
-                    {
-                        entry.quad.physics.target = Vec2::new(x, y);
-                        entry.quad.size_physics.target = Vec2::new(w, h);
+                    let has_visual_override = !unsafe { GetPropW(hwnd, windows::core::w!("ChickenWM_VisualRect")) }.0.is_null();
+                    if !has_visual_override {
+                        entry.native_rect = rc;
+                        if !expose.active
+                            || !matches!(role, WindowRole::Tiled | WindowRole::Floating)
+                        {
+                            entry.quad.physics.target = Vec2::new(x, y);
+                            entry.quad.size_physics.target = Vec2::new(w, h);
+                        }
                     }
                     entry.quad.z_order = z_idx as i32;
                     entry.role = role;
@@ -844,7 +856,23 @@ async fn main() -> Result<()> {
         let mut expose_returning = false;
         for entry in managed_windows.values_mut() {
             if !expose.active && entry.role != WindowRole::Desktop {
-                if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
+                // Check if ChickenWM has set a visual target override during interactive GPU scaling
+                let visual_prop = unsafe { GetPropW(entry.quad.hwnd, windows::core::w!("ChickenWM_VisualRect")) };
+                if !visual_prop.0.is_null() {
+                    let packed = visual_prop.0 as usize as u64;
+                    let x = (packed >> 48) as i16 as i32;
+                    let y = ((packed >> 32) & 0xFFFF) as i16 as i32;
+                    let w = ((packed >> 16) & 0xFFFF) as i32;
+                    let h = (packed & 0xFFFF) as i32;
+                    entry.native_rect = RECT {
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
+                    };
+                    entry.quad.physics.target = Vec2::new(x as f32, y as f32);
+                    entry.quad.size_physics.target = Vec2::new(w.max(1) as f32, h.max(1) as f32);
+                } else if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
                     entry.native_rect = rc;
                     let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
                     let target_size = Vec2::new(
@@ -886,8 +914,10 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let has_visual_override = !unsafe { GetPropW(entry.quad.hwnd, windows::core::w!("ChickenWM_VisualRect")) }.0.is_null();
             if !in_expose_transition
                 || (lbutton_down && !expose.active)
+                || has_visual_override
                 || matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay | WindowRole::Desktop)
             {
                 // Keep locked 1:1 to real window geometry in normal desktop mode so scaling/resizing has 0ms lag
