@@ -20,6 +20,7 @@ members = [
     "chickenwm-shot",
     "coop",
     "chickenscope",
+    "chickenwm-downloader",
 ]
 
 [patch."https://github.com/despale-code/chickenwm-core"]
