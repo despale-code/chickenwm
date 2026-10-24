@@ -151,6 +151,28 @@ pub struct WorkerControl {
     pub item_limit_kbps: AtomicU32,
 }
 
+pub fn deduplicate_cookies(cookies: &str) -> String {
+    let mut map = std::collections::HashMap::new();
+    let mut order = Vec::new();
+    for part in cookies.split(';') {
+        let p = part.trim();
+        if let Some((k, v)) = p.split_once('=') {
+            let k_trim = k.trim();
+            if !k_trim.is_empty() {
+                if !map.contains_key(k_trim) {
+                    order.push(k_trim.to_string());
+                }
+                map.insert(k_trim.to_string(), v.trim().to_string());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| format!("{k}={}", map.get(&k).unwrap()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub struct DownloadEngine {
     pub state: Arc<RwLock<PersistedState>>,
     pub state_path: PathBuf,
@@ -517,8 +539,8 @@ impl DownloadEngine {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(DEFAULT_BROWSER_UA);
 
-        // Allow up to 3 interstitial hops (e.g. Google Drive /file/d/ -> virus scan form -> direct stream)
-        for attempt in 0..3 {
+        // Allow up to 5 interstitial hops (e.g. Google Drive /file/d/ -> virus scan form -> direct stream)
+        for attempt in 0..5 {
             let part_path = self
                 .state
                 .read()
@@ -537,6 +559,7 @@ impl DownloadEngine {
             let mut cmd = Command::new("curl.exe");
             cmd.args([
                 "-sSL",
+                "--location-trusted",
                 "--fail",
                 "--compressed",
                 "--max-redirs",
@@ -557,8 +580,9 @@ impl DownloadEngine {
                 &header_path.to_string_lossy(),
             ]);
             if let Some(ref cookies) = snapshot.cookies {
-                if !cookies.trim().is_empty() {
-                    cmd.args(["-H", &format!("Cookie: {}", cookies.trim())]);
+                let dedup = deduplicate_cookies(cookies);
+                if !dedup.trim().is_empty() {
+                    cmd.args(["-H", &format!("Cookie: {}", dedup.trim())]);
                 }
             }
             if let Some(ref referer) = snapshot.referer {
@@ -703,29 +727,56 @@ impl DownloadEngine {
             }
 
             // Check if the response was an HTML confirmation / interstitial page (e.g. Google Drive virus scan or MediaFire)
-            if existing_len == 0
-                && content_type_is_html
-                && received < 512 * 1024
+            let is_html_response = content_type_is_html || {
+                std::fs::File::open(&part_path)
+                    .and_then(|mut f| {
+                        let mut head = [0u8; 512];
+                        let n = f.read(&mut head)?;
+                        let s = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+                        Ok(s.contains("<!doctype html") || s.contains("<html"))
+                    })
+                    .unwrap_or(false)
+            };
+
+            if is_html_response
                 && !url_explicitly_requests_html(&current_url)
+                && !url_explicitly_requests_html(&snapshot.filename)
             {
-                if let Ok(html_body) = std::fs::read_to_string(&part_path) {
-                    if let Some((next_url, html_filename)) =
-                        resolve_html_interstitial(&current_url, &html_body)
-                    {
-                        if let Some(fname) = html_filename {
-                            let clean = sanitize_filename(&fname);
-                            if !clean.is_empty() {
-                                if let Some(item) =
-                                    self.state.write().items.iter_mut().find(|i| i.id == id)
-                                {
-                                    item.filename = clean;
-                                }
+                let html_body = std::fs::read_to_string(&part_path).unwrap_or_default();
+                if let Some((next_url, html_filename)) =
+                    resolve_html_interstitial(&current_url, &html_body)
+                {
+                    if let Some(fname) = html_filename {
+                        let clean = sanitize_filename(&fname);
+                        if !clean.is_empty() {
+                            if let Some(item) =
+                                self.state.write().items.iter_mut().find(|i| i.id == id)
+                            {
+                                item.filename = clean;
                             }
                         }
-                        let _ = std::fs::remove_file(&part_path);
-                        current_url = next_url;
-                        continue;
                     }
+                    let _ = std::fs::remove_file(&part_path);
+                    current_url = next_url;
+                    continue;
+                }
+
+                // If HTML interstitial could not be resolved, DO NOT mark as completed!
+                let _ = std::fs::remove_file(&part_path);
+                let _ = std::fs::remove_file(&cookie_jar);
+                let lower_body = html_body.to_ascii_lowercase();
+                if lower_body.contains("cookiemismatch")
+                    || lower_body.contains("accounts.google.com")
+                    || lower_body.contains("oturum aç")
+                    || lower_body.contains("sign in")
+                {
+                    bail!("Google Drive authentication required or session expired (redirected to Google Login).");
+                } else if lower_body.contains("uc-warning-caption")
+                    || lower_body.contains("virus scan warning")
+                {
+                    bail!("Google Drive confirmation required, but direct download token could not be obtained.");
+                } else {
+                    bail!("Download failed: Server returned an HTML web page instead of the requested file.");
                 }
             }
 
@@ -1059,19 +1110,30 @@ pub fn normalize_download_url(raw_url: &str) -> String {
 
     // 1. Google Drive (`/file/d/<ID>`, `/open?id=<ID>`, `/uc?id=<ID>`, `drive.usercontent.google.com`)
     if lower.contains("drive.google.com") || lower.contains("drive.usercontent.google.com") {
-        if let Some(file_id) = extract_google_drive_id(trim) {
-            // If it is already a `drive.usercontent.google.com/download` URL with `uuid=` or `at=`,
-            // preserve all query params and ensure `confirm=t` is present.
-            if lower.contains("drive.usercontent.google.com/download") {
-                if !lower.contains("confirm=") {
-                    let sep = if trim.contains('?') { '&' } else { '?' };
-                    return format!("{trim}{sep}confirm=t");
-                }
-                return trim.to_string();
+        if lower.contains("drive.usercontent.google.com/download") {
+            if !lower.contains("confirm=") {
+                let sep = if trim.contains('?') { '&' } else { '?' };
+                return format!("{trim}{sep}confirm=t");
             }
-            return format!(
-                "https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
-            );
+            return trim.to_string();
+        }
+        if let Some(file_id) = extract_google_drive_id(trim) {
+            let authuser = if let Some((_, query)) = trim.split_once('?') {
+                query
+                    .split('&')
+                    .find_map(|kv| {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            if k.eq_ignore_ascii_case("authuser") {
+                                return Some(format!("&authuser={}", v.trim()));
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            return format!("https://drive.google.com/uc?id={file_id}&export=download{authuser}");
         }
     }
 
@@ -1194,9 +1256,16 @@ pub fn resolve_html_interstitial(current_url: &str, html: &str) -> Option<(Strin
                 .unwrap_or(html.len());
             let form_slice = &html[form_region_start..form_region_end];
 
-            let action = extract_attr_value(form_slice, "action")
+            let raw_action = extract_attr_value(form_slice, "action")
                 .unwrap_or_else(|| "https://drive.usercontent.google.com/download".to_string())
                 .replace("&amp;", "&");
+            let action = if raw_action.starts_with("http://") || raw_action.starts_with("https://") {
+                raw_action
+            } else if raw_action.starts_with('/') {
+                format!("https://drive.usercontent.google.com{raw_action}")
+            } else {
+                format!("https://drive.usercontent.google.com/{raw_action}")
+            };
 
             let mut params: Vec<(String, String)> = Vec::new();
             let mut search_from = 0;
@@ -1261,14 +1330,30 @@ pub fn resolve_html_interstitial(current_url: &str, html: &str) -> Option<(Strin
 }
 
 fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let pat = format!("{attr}={quote}");
-        if let Some(pos) = tag.find(&pat) {
-            let start = pos + pat.len();
-            if let Some(end_rel) = tag[start..].find(quote) {
-                return Some(tag[start..start + end_rel].to_string());
+    let tag_lower = tag.to_ascii_lowercase();
+    let pat = attr.to_ascii_lowercase();
+    let mut search_idx = 0;
+    while let Some(idx) = tag_lower[search_idx..].find(&pat) {
+        let abs_idx = search_idx + idx;
+        let after = &tag[abs_idx + pat.len()..];
+        let after_trim = after.trim_start();
+        if let Some(stripped) = after_trim.strip_prefix('=') {
+            let val_part = stripped.trim_start();
+            if let Some(quote) = val_part.chars().next() {
+                if quote == '"' || quote == '\'' {
+                    let content = &val_part[1..];
+                    if let Some(end_quote) = content.find(quote) {
+                        return Some(content[..end_quote].to_string());
+                    }
+                } else {
+                    let end = val_part
+                        .find(|c: char| c.is_whitespace() || c == '>')
+                        .unwrap_or(val_part.len());
+                    return Some(val_part[..end].to_string());
+                }
             }
         }
+        search_idx = abs_idx + pat.len();
     }
     None
 }
@@ -1475,10 +1560,14 @@ mod tests {
     fn normalizes_google_drive_and_cloud_service_urls() {
         assert_eq!(
             normalize_download_url("https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view?usp=sharing"),
-            "https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download&confirm=t"
+            "https://drive.google.com/uc?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download"
         );
         assert_eq!(
             normalize_download_url("https://drive.google.com/open?id=1AbCdEfGhIjKlMnOpQrStUvWxYz"),
+            "https://drive.google.com/uc?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download"
+        );
+        assert_eq!(
+            normalize_download_url("https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download"),
             "https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download&confirm=t"
         );
         assert_eq!(
