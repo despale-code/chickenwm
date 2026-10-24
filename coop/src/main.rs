@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 use anyhow::Result;
+use ash::vk;
 use coop::capture::{CaptureDevice, WindowCaptureSession};
 use coop::input::{
     enforce_english_keyboard_layout, register_high_polling_mouse, sync_hardware_cursor,
@@ -22,22 +23,117 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
-    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
 };
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetShellWindow,
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, PeekMessageW, SetWindowLongW,
-    SetWindowPos, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, MSG, PM_REMOVE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_TOOLWINDOW, WS_POPUP,
-    WS_THICKFRAME,
+    DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetPropW, GetShellWindow,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, IsIconic, IsWindowVisible,
+    PeekMessageW, SetWindowLongW, SetWindowPos, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+    MSG, PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowRole {
+    Desktop,
+    Roobar,
+    TransparentOverlay,
+    Floating,
+    Tiled,
+}
 
 struct ManagedWindow {
     quad: WindowQuad,
     capture: WindowCaptureSession,
     vk_tex: Option<ImportedVulkanTexture>,
+    descriptor_set: Option<vk::DescriptorSet>,
+    role: WindowRole,
+}
+
+fn get_window_title(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn get_window_class(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn classify_window_role(hwnd: HWND) -> WindowRole {
+    unsafe {
+        if hwnd == GetShellWindow() {
+            return WindowRole::Desktop;
+        }
+        let class = get_window_class(hwnd);
+        if class == "Progman" || class == "WorkerW" || class == "ChickenWMPaperClass" {
+            return WindowRole::Desktop;
+        }
+
+        let title = get_window_title(hwnd);
+        if title == "ChickenWM Bar — roobar" || title.starts_with("ChickenWM Bar") {
+            return WindowRole::Roobar;
+        }
+        if title.starts_with("roobar ")
+            || title == "ChickenWM Power"
+            || title == "ChickenWM Launcher"
+            || title == "ChickenWM Notifications"
+            || class == "#32768"
+        {
+            return WindowRole::TransparentOverlay;
+        }
+
+        // Check authoritative ChickenWM_Managed / ChickenWM_Tiled window properties set by chickenwm-wm
+        let managed = GetPropW(hwnd, windows::core::w!("ChickenWM_Managed"));
+        let tiled = GetPropW(hwnd, windows::core::w!("ChickenWM_Tiled"));
+        if !managed.0.is_null() {
+            return if !tiled.0.is_null() {
+                WindowRole::Tiled
+            } else {
+                WindowRole::Floating
+            };
+        }
+
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let has_owner = GetWindow(hwnd, GW_OWNER)
+            .map(|h| !h.0.is_null())
+            .unwrap_or(false);
+
+        if (style & WS_POPUP.0) != 0
+            || has_owner
+            || (ex_style & (WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)) != 0
+        {
+            return WindowRole::Floating;
+        }
+
+        if (style & (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0)) == 0
+            && (ex_style & WS_EX_LAYERED.0) != 0
+        {
+            return WindowRole::TransparentOverlay;
+        }
+
+        WindowRole::Tiled
+    }
 }
 
 /// Returns the actual visible frame bounds of `hwnd`, excluding invisible Win10/Win11 drop-shadow padding.
@@ -66,11 +162,11 @@ fn get_window_extended_bounds(hwnd: HWND) -> Option<RECT> {
 }
 
 /// Hides Windows 11's native 1px DWM border (`DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`), clears any
-/// bogus white `DWMWA_CAPTION_COLOR` override, and restores `WS_CAPTION | WS_THICKFRAME` if it was
-/// previously stripped on a non-popup window (preventing the Win95 fallback titlebar and thick grey frame).
-fn heal_native_window_frame(hwnd: HWND) {
+/// bogus white `DWMWA_CAPTION_COLOR` override, heals frameless transparent overlays (`roobar`),
+/// and restores `WS_CAPTION | WS_THICKFRAME` only on standard overlapped windows (`WS_SYSMENU`).
+fn heal_native_window_frame(hwnd: HWND, role: WindowRole) {
     unsafe {
-        if hwnd == GetShellWindow() {
+        if role == WindowRole::Desktop {
             return;
         }
         let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE (valid only for DWMWA_BORDER_COLOR)
@@ -96,7 +192,47 @@ fn heal_native_window_frame(hwnd: HWND) {
 
         let cur = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
-        if (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
+
+        if matches!(role, WindowRole::Roobar | WindowRole::TransparentOverlay) {
+            // Ensure frameless transparent windows never have WS_CAPTION | WS_THICKFRAME or full-window DWM backdrop
+            if (cur & frame) != 0 {
+                let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur & !frame) as i32);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            let no_round = DWMWCP_DONOTROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &no_round as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&no_round) as u32,
+            );
+            let no_backdrop: u32 = 1; // DWMSBT_NONE
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &no_backdrop as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let margins = MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            return;
+        }
+
+        // Only restore WS_CAPTION | WS_THICKFRAME on standard overlapped windows that have WS_SYSMENU
+        if (cur & WS_SYSMENU.0) != 0 && (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
             let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur | frame) as i32);
             let _ = SetWindowPos(
                 hwnd,
@@ -145,21 +281,25 @@ fn enumerate_visible_windows_back_to_front(canvas_hwnds: &[HWND]) -> Vec<(HWND, 
             let class_name = String::from_utf16_lossy(&class_buf[..len]);
             if class_name == "CoopVulkanCanvasClass"
                 || class_name == "ChickenScopeHudOverlayClass"
+                || class_name == "ChickenWMBorderOverlayClass"
                 || class_name == "Progman"
                 || class_name == "WorkerW"
             {
                 return BOOL(1);
             }
 
+            let title = get_window_title(hwnd);
+            let is_chicken_ui = title.starts_with("ChickenWM") || title.starts_with("roobar");
+
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            if (ex_style & WS_EX_TOOLWINDOW.0) != 0 && class_name != "#32768" {
+            if (ex_style & WS_EX_TOOLWINDOW.0) != 0 && class_name != "#32768" && !is_chicken_ui {
                 return BOOL(1);
             }
 
             if let Some(rc) = get_window_extended_bounds(hwnd) {
                 let w = rc.right - rc.left;
                 let h = rc.bottom - rc.top;
-                if w > 24 && h > 24 {
+                if w > 16 && h > 16 {
                     list.push((hwnd, rc));
                 }
             }
@@ -315,13 +455,15 @@ async fn main() -> Result<()> {
                 let y = rc.top as f32;
                 let w = (rc.right - rc.left).max(1) as f32;
                 let h = (rc.bottom - rc.top).max(1) as f32;
+                let role = classify_window_role(hwnd);
 
                 if let Some(entry) = managed_windows.get_mut(&key) {
                     entry.quad.physics.target = Vec2::new(x, y);
                     entry.quad.size_physics.target = Vec2::new(w, h);
                     entry.quad.z_order = z_idx as i32;
+                    entry.role = role;
                 } else if !failed_hwnds.contains(&key) {
-                    heal_native_window_frame(hwnd);
+                    heal_native_window_frame(hwnd, role);
                     if let Some(ref cdev) = capture_dev {
                         match WindowCaptureSession::start_with_device(hwnd, cdev) {
                             Ok(cap) => {
@@ -342,6 +484,10 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 });
+                                let descriptor_set =
+                                    vk_ctx.as_ref().zip(vk_tex.as_ref()).and_then(|(ctx, t)| {
+                                        pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
+                                    });
                                 let mut quad = WindowQuad::new(hwnd, Vec2::new(x, y), w, h);
                                 quad.z_order = z_idx as i32;
                                 quad.set_speed(anim_speed);
@@ -351,6 +497,8 @@ async fn main() -> Result<()> {
                                         quad,
                                         capture: cap,
                                         vk_tex,
+                                        descriptor_set,
+                                        role,
                                     },
                                 );
                             }
@@ -368,9 +516,16 @@ async fn main() -> Result<()> {
                 if seen.contains(k) {
                     true
                 } else {
-                    if let (Some(ctx), Some(mut tex)) = (vk_ctx.as_ref(), entry.vk_tex.take()) {
-                        unsafe {
-                            tex.destroy(&ctx.device);
+                    if let Some(ref ctx) = vk_ctx {
+                        if let Some(ds) = entry.descriptor_set.take() {
+                            unsafe {
+                                pipeline.free_texture_descriptor_set(&ctx.device, ds);
+                            }
+                        }
+                        if let Some(mut tex) = entry.vk_tex.take() {
+                            unsafe {
+                                tex.destroy(&ctx.device);
+                            }
                         }
                     }
                     false
@@ -430,6 +585,11 @@ async fn main() -> Result<()> {
                 if entry.capture.handle_recreated {
                     entry.capture.handle_recreated = false;
                     if let Some(ref ctx) = vk_ctx {
+                        if let Some(ds) = entry.descriptor_set.take() {
+                            unsafe {
+                                pipeline.free_texture_descriptor_set(&ctx.device, ds);
+                            }
+                        }
                         if let Some(mut old_tex) = entry.vk_tex.take() {
                             unsafe {
                                 ctx.wait_idle();
@@ -443,12 +603,17 @@ async fn main() -> Result<()> {
                                 entry.capture.height,
                             )
                             .ok();
+                        entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
+                            pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
+                        });
                     }
                 }
             }
 
-            if lbutton_down && entry.quad.hwnd == fg_hwnd {
-                // Keep locked to target position during real-time mouse drag
+            if (lbutton_down && entry.quad.hwnd == fg_hwnd)
+                || matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay | WindowRole::Desktop)
+            {
+                // Keep locked to target position during real-time mouse drag or for roobar/overlays
                 entry.quad.physics.position = entry.quad.physics.target;
                 entry.quad.physics.velocity = Vec2::default();
                 entry.quad.size_physics.position = entry.quad.size_physics.target;
@@ -466,7 +631,7 @@ async fn main() -> Result<()> {
             let clear_rgba = if locked {
                 [0.04, 0.04, 0.07, 1.0]
             } else {
-                [0.08, 0.09, 0.12, 1.0] // Sleek dark slate fallback behind wallpaper/windows
+                [0.0, 0.0, 0.0, 0.0] // Transparent clear so desktop wallpaper & transparent surfaces never turn black
             };
 
             let active_popups = HierarchyTracker::active_popups();
@@ -479,25 +644,15 @@ async fn main() -> Result<()> {
                 let _ = sc.render_and_present(
                     ctx,
                     clear_rgba,
-                    |cmd_buf, dst_img| {
+                    |cmd_buf, _dst_img| {
                         if !locked {
-                            // Blit every captured window texture in back-to-front Z-order
+                            // Transition all captured window textures to SHADER_READ_ONLY_OPTIMAL for alpha-blended sampling
                             for key in &z_ordered_keys {
                                 if let Some(entry) = managed_windows.get(key) {
                                     if entry.capture.has_frame {
                                         if let Some(ref tex) = entry.vk_tex {
-                                            let x0 =
-                                                (entry.quad.physics.position.x.round() as i32) - mon_x;
-                                            let y0 =
-                                                (entry.quad.physics.position.y.round() as i32) - mon_y;
-                                            let x1 = x0 + (entry.quad.width.round() as i32);
-                                            let y1 = y0 + (entry.quad.height.round() as i32);
-
                                             unsafe {
-                                                ctx.record_blit_window(
-                                                    cmd_buf, tex.image, tex.width, tex.height,
-                                                    dst_img, x0, y0, x1, y1, mon_w, mon_h,
-                                                );
+                                                ctx.record_transition_for_sampling(cmd_buf, tex.image);
                                             }
                                         }
                                     }
@@ -529,18 +684,68 @@ async fn main() -> Result<()> {
                                 corner_radius,
                             );
                         } else {
-                            let shell_hwnd = unsafe { GetShellWindow() };
-                            let unfocused_colors = MacBorderColors::for_state(theme_mode, false)
-                                .with_corner_mask(clear_rgba);
-                            let focused_colors = MacBorderColors::for_state(theme_mode, true)
-                                .with_corner_mask(clear_rgba);
+                            let unfocused_colors = MacBorderColors::for_state(theme_mode, false);
+                            let focused_colors = MacBorderColors::for_state(theme_mode, true);
                             let popup_colors = MacBorderColors::for_state(theme_mode, true);
 
-                            // macOS Shadowless Dual-Rim: unfocused border on inactive visible windows
+                            // Draw all windows in back-to-front Z-order with premultiplied alpha blending
                             for key in &z_ordered_keys {
-                                if *key != (fg_hwnd.0 as isize) && *key != (shell_hwnd.0 as isize) {
-                                    if let Some(entry) = managed_windows.get(key) {
-                                        if entry.capture.has_frame {
+                                if let Some(entry) = managed_windows.get(key) {
+                                    if !entry.capture.has_frame {
+                                        continue;
+                                    }
+                                    let is_focused = *key == (fg_hwnd.0 as isize);
+                                    let is_tiled = entry.role == WindowRole::Tiled;
+                                    // Forced border radius is ONLY for tiled windows!
+                                    let quad_radius = if is_tiled { corner_radius } else { 0 };
+                                    let force_opaque =
+                                        matches!(entry.role, WindowRole::Tiled | WindowRole::Desktop);
+
+                                    if let Some(ds) = entry.descriptor_set {
+                                        pipeline.record_textured_quad(
+                                            device,
+                                            cmd_buf,
+                                            ds,
+                                            &entry.quad,
+                                            mon_x,
+                                            mon_y,
+                                            mon_w,
+                                            mon_h,
+                                            quad_radius,
+                                            force_opaque,
+                                        );
+                                    }
+
+                                    match entry.role {
+                                        WindowRole::Desktop | WindowRole::TransparentOverlay => {}
+                                        WindowRole::Roobar => {
+                                            // Roobar, when not floating (docked full monitor width),
+                                            // only renders border on bottom and has 0 border radius.
+                                            let bar_w = entry.quad.width.round() as i32;
+                                            let bar_x = (entry.quad.physics.position.x.round() as i32) - mon_x;
+                                            let is_docked = bar_x <= 2 && bar_w >= (mon_w as i32 - 4);
+                                            if is_docked {
+                                                pipeline.record_mac_dual_rim_border_ex(
+                                                    device,
+                                                    cmd_buf,
+                                                    &entry.quad,
+                                                    mon_x,
+                                                    mon_y,
+                                                    mon_w,
+                                                    mon_h,
+                                                    unfocused_colors,
+                                                    0,
+                                                    true,
+                                                );
+                                            }
+                                        }
+                                        WindowRole::Floating => {
+                                            // Floating windows do not get forced border radius
+                                            let colors = if is_focused {
+                                                focused_colors
+                                            } else {
+                                                unfocused_colors
+                                            };
                                             pipeline.record_mac_dual_rim_border(
                                                 device,
                                                 cmd_buf,
@@ -549,45 +754,48 @@ async fn main() -> Result<()> {
                                                 mon_y,
                                                 mon_w,
                                                 mon_h,
-                                                unfocused_colors,
-                                                corner_radius,
+                                                colors,
+                                                0,
                                             );
                                         }
-                                    }
-                                }
-                            }
-
-                            // macOS Shadowless Dual-Rim: focused border on active window
-                            if let Some(fg_entry) = managed_windows.get(&(fg_hwnd.0 as isize)) {
-                                if fg_hwnd != shell_hwnd {
-                                    pipeline.record_mac_dual_rim_border(
-                                        device,
-                                        cmd_buf,
-                                        &fg_entry.quad,
-                                        mon_x,
-                                        mon_y,
-                                        mon_w,
-                                        mon_h,
-                                        focused_colors,
-                                        corner_radius,
-                                    );
-
-                                    for popup in &active_popups {
-                                        let pquad = HierarchyTracker::compute_relative_popup_quad(
-                                            popup,
-                                            &fg_entry.quad,
-                                        );
-                                        pipeline.record_mac_dual_rim_border(
-                                            device,
-                                            cmd_buf,
-                                            &pquad,
-                                            mon_x,
-                                            mon_y,
-                                            mon_w,
-                                            mon_h,
-                                            popup_colors,
-                                            corner_radius.min(8),
-                                        );
+                                        WindowRole::Tiled => {
+                                            let colors = if is_focused {
+                                                focused_colors
+                                            } else {
+                                                unfocused_colors
+                                            };
+                                            pipeline.record_mac_dual_rim_border(
+                                                device,
+                                                cmd_buf,
+                                                &entry.quad,
+                                                mon_x,
+                                                mon_y,
+                                                mon_w,
+                                                mon_h,
+                                                colors,
+                                                corner_radius,
+                                            );
+                                            if is_focused {
+                                                for popup in &active_popups {
+                                                    let pquad =
+                                                        HierarchyTracker::compute_relative_popup_quad(
+                                                            popup,
+                                                            &entry.quad,
+                                                        );
+                                                    pipeline.record_mac_dual_rim_border(
+                                                        device,
+                                                        cmd_buf,
+                                                        &pquad,
+                                                        mon_x,
+                                                        mon_y,
+                                                        mon_w,
+                                                        mon_h,
+                                                        popup_colors,
+                                                        0,
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -627,6 +835,11 @@ async fn main() -> Result<()> {
     if let Some(ref ctx) = vk_ctx {
         ctx.wait_idle();
         for entry in managed_windows.values_mut() {
+            if let Some(ds) = entry.descriptor_set.take() {
+                unsafe {
+                    pipeline.free_texture_descriptor_set(&ctx.device, ds);
+                }
+            }
             if let Some(mut tex) = entry.vk_tex.take() {
                 unsafe {
                     tex.destroy(&ctx.device);

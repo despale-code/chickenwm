@@ -353,6 +353,40 @@ impl VulkanContext {
         }
     }
 
+    /// Transitions an imported DXGI texture (`src_img`) into `SHADER_READ_ONLY_OPTIMAL`
+    /// prior to beginning the RenderPass so `record_textured_quad` can sample it with alpha blending.
+    pub unsafe fn record_transition_for_sampling(
+        &self,
+        cmd_buf: vk::CommandBuffer,
+        src_img: vk::Image,
+    ) {
+        unsafe {
+            let src_barrier = [vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .image(src_img)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+
+            self.device.cmd_pipeline_barrier(
+                cmd_buf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &src_barrier,
+            );
+        }
+    }
+
     /// Phase 5.3: Halts GPU queues and drops rendering to 0 FPS during DPMS sleep or Game Mode passthrough.
     pub fn wait_idle(&self) {
         unsafe {

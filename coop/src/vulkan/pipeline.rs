@@ -68,19 +68,107 @@ pub fn premultiplied_alpha_blend_attachment() -> vk::PipelineColorBlendAttachmen
         .color_write_mask(vk::ColorComponentFlags::RGBA)
 }
 
+/// Push constants for the textured window quad pipeline (premultiplied alpha + SDF corner clip).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowQuadPushConstants {
+    /// Window rectangle `(x, y, width, height)` in monitor-local pixels.
+    pub rect: [f32; 4],
+    /// `(screen_width, screen_height, corner_radius, force_opaque_rgb)`.
+    pub screen_and_radius: [f32; 4],
+}
+
+const QUAD_SHADER_WGSL: &str = r#"
+struct WindowQuadPushConstants {
+    rect: vec4<f32>,
+    screen_and_radius: vec4<f32>,
+};
+
+var<push_constant> pc: WindowQuadPushConstants;
+
+@group(0) @binding(0)
+var win_tex: texture_2d<f32>;
+@group(0) @binding(1)
+var win_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) local_p: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
+    var uv = vec2<f32>(0.0, 0.0);
+    switch vid {
+        case 0u: { uv = vec2<f32>(0.0, 0.0); }
+        case 1u: { uv = vec2<f32>(1.0, 0.0); }
+        case 2u: { uv = vec2<f32>(0.0, 1.0); }
+        case 3u: { uv = vec2<f32>(0.0, 1.0); }
+        case 4u: { uv = vec2<f32>(1.0, 0.0); }
+        default: { uv = vec2<f32>(1.0, 1.0); }
+    }
+
+    let pixel_pos = pc.rect.xy + uv * pc.rect.zw;
+    let center = pc.rect.xy + pc.rect.zw * 0.5;
+    let screen_size = max(pc.screen_and_radius.xy, vec2<f32>(1.0, 1.0));
+    let ndc = (pixel_pos / screen_size) * 2.0 - vec2<f32>(1.0, 1.0);
+
+    var out: VertexOutput;
+    out.position = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
+    out.uv = uv;
+    out.local_p = pixel_pos - center;
+    return out;
+}
+
+fn sd_rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - (half_size - vec2<f32>(r, r));
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color = textureSample(win_tex, win_sampler, in.uv);
+    let half_size = pc.rect.zw * 0.5;
+    let max_r = min(half_size.x, half_size.y);
+    let r = clamp(pc.screen_and_radius.z, 0.0, max_r);
+
+    var clip_cov = 1.0;
+    if (r > 0.5) {
+        let d = sd_rounded_box(in.local_p, half_size, r);
+        clip_cov = clamp(0.5 - d, 0.0, 1.0);
+    }
+
+    if (clip_cov <= 0.001) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // pc.screen_and_radius.w > 0.5 indicates an opaque client surface (e.g. tiled app / wallpaper)
+    // where GDI child controls might leave alpha=0; <= 0.5 preserves per-pixel alpha (roobar, popovers, etc.)
+    if (pc.screen_and_radius.w > 0.5) {
+        return vec4<f32>(tex_color.rgb * clip_cov, clip_cov);
+    }
+
+    if (tex_color.a <= 0.001) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    return tex_color * clip_cov;
+}
+"#;
+
 /// Push constants for the anti-aliased SDF macOS Shadowless Dual-Rim rounded border shader.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BorderPushConstants {
     /// Window rectangle `(x, y, width, height)` in monitor-local pixels.
     pub rect: [f32; 4],
-    /// `(screen_width, screen_height, corner_radius, 0.0)`.
+    /// `(screen_width, screen_height, corner_radius, bottom_only_flag)`.
     pub screen_and_radius: [f32; 4],
     /// Outer 1px perimeter stroke color `[r, g, b, a]` (unpremultiplied).
     pub outer_color: [f32; 4],
     /// Inner top 1px specular bevel highlight `[r, g, b, a]` (unpremultiplied).
     pub inner_top_color: [f32; 4],
-    /// Background color `[r, g, b, a]` used to mask sharp 90-degree blitted corners outside the rounded arc.
+    /// Reserved / optional mask color `[r, g, b, a]`.
     pub corner_mask_color: [f32; 4],
 }
 
@@ -135,9 +223,21 @@ fn sd_rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let half_size = pc.rect.zw * 0.5;
+    let p = in.local_p;
+
+    // Docked roobar mode (bottom_only_flag > 0.5): 0 border radius, 1px border on bottom edge only
+    if (pc.screen_and_radius.w > 0.5) {
+        if (abs(p.x) > half_size.x) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+        let dy = p.y - (half_size.y - 0.5);
+        let cov = clamp(1.0 - abs(dy), 0.0, 1.0);
+        let a = pc.outer_color.a * cov;
+        return vec4<f32>(pc.outer_color.rgb * a, a);
+    }
+
     let max_r = min(half_size.x, half_size.y);
     let r = clamp(pc.screen_and_radius.z, 0.0, max_r);
-    let p = in.local_p;
 
     let d = sd_rounded_box(p, half_size, r);
 
@@ -145,42 +245,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // 1. Anti-aliased corner clipping mask inside the 4 corner regions of the blitted rectangular window
-    var mask_cov = 0.0;
-    if (r > 0.5 && abs(p.x) <= half_size.x && abs(p.y) <= half_size.y) {
-        if (abs(p.x) > half_size.x - r && abs(p.y) > half_size.y - r) {
-            mask_cov = clamp(d + 0.5, 0.0, 1.0);
-        }
-    }
-    let a_m = pc.corner_mask_color.a * mask_cov;
-    let rgb_m = pc.corner_mask_color.rgb;
-
-    // 2. Anti-aliased 1px outer perimeter stroke: d in [0.0, 1.0]
+    // 1. Anti-aliased 1px outer perimeter stroke: d in [0.0, 1.0]
     let outer_cov = clamp(min(d + 0.5, 1.5 - d), 0.0, 1.0);
 
-    // 3. Anti-aliased 1px inner top specular bevel: inset 0 1px 0 0
-    // Inside original rounded box (d <= 0) and outside rounded box shifted down by +1px (d_shift >= 0)
+    // 2. Anti-aliased 1px inner top specular bevel: inset 0 1px 0 0
     let d_shift = sd_rounded_box(p - vec2<f32>(0.0, 1.0), half_size, r);
     let inner_cov = clamp(min(0.5 - d, 0.5 + d_shift), 0.0, 1.0);
 
     let a_outer = pc.outer_color.a * outer_cov;
     let a_inner = pc.inner_top_color.a * inner_cov;
 
-    // Composite inner top bevel and outer perimeter stroke
-    let a_s = a_outer + (1.0 - a_outer) * a_inner;
-    let premul_s = pc.outer_color.rgb * a_outer + (1.0 - a_outer) * (pc.inner_top_color.rgb * a_inner);
-
-    // Composite dual-rim stroke over corner mask in premultiplied alpha space
-    let out_premul_rgb = premul_s + (1.0 - a_s) * (rgb_m * a_m);
-    let out_a = a_s + (1.0 - a_s) * a_m;
+    // Composite inner top bevel and outer perimeter stroke in premultiplied alpha space
+    let out_a = a_outer + (1.0 - a_outer) * a_inner;
+    let out_premul_rgb = pc.outer_color.rgb * a_outer + (1.0 - a_outer) * (pc.inner_top_color.rgb * a_inner);
 
     return vec4<f32>(out_premul_rgb, out_a);
 }
 "#;
 
-/// Compiles the embedded WGSL rounded-border shader into Vertex and Fragment SPIR-V words.
-pub fn compile_border_spirv() -> Result<(Vec<u32>, Vec<u32>)> {
-    let module = naga::front::wgsl::parse_str(BORDER_SHADER_WGSL)
+fn compile_wgsl_spirv(wgsl: &str) -> Result<(Vec<u32>, Vec<u32>)> {
+    let module = naga::front::wgsl::parse_str(wgsl)
         .map_err(|e| anyhow::anyhow!("WGSL parse error: {}", e))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -209,11 +293,26 @@ pub fn compile_border_spirv() -> Result<(Vec<u32>, Vec<u32>)> {
     Ok((vs_words, fs_words))
 }
 
+/// Compiles the embedded WGSL rounded-border shader into Vertex and Fragment SPIR-V words.
+pub fn compile_border_spirv() -> Result<(Vec<u32>, Vec<u32>)> {
+    compile_wgsl_spirv(BORDER_SHADER_WGSL)
+}
+
+/// Compiles the embedded WGSL textured window quad shader into Vertex and Fragment SPIR-V words.
+pub fn compile_quad_spirv() -> Result<(Vec<u32>, Vec<u32>)> {
+    compile_wgsl_spirv(QUAD_SHADER_WGSL)
+}
+
 /// Configures Vulkan pipeline states for compositing window quads and GPU border accents.
 pub struct CompositorPipeline {
     pub blend_attachment: vk::PipelineColorBlendAttachmentState,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
+    pub sampler: vk::Sampler,
+    pub quad_desc_layout: vk::DescriptorSetLayout,
+    pub quad_desc_pool: vk::DescriptorPool,
+    pub quad_layout: vk::PipelineLayout,
+    pub quad_pipeline: vk::Pipeline,
     pub border_layout: vk::PipelineLayout,
     pub border_pipeline: vk::Pipeline,
 }
@@ -229,6 +328,11 @@ impl CompositorPipeline {
             blend_attachment: premultiplied_alpha_blend_attachment(),
             layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            sampler: vk::Sampler::null(),
+            quad_desc_layout: vk::DescriptorSetLayout::null(),
+            quad_desc_pool: vk::DescriptorPool::null(),
+            quad_layout: vk::PipelineLayout::null(),
+            quad_pipeline: vk::Pipeline::null(),
             border_layout: vk::PipelineLayout::null(),
             border_pipeline: vk::Pipeline::null(),
         })
@@ -250,7 +354,8 @@ impl CompositorPipeline {
         Ok(())
     }
 
-    /// Compiles and initializes the anti-aliased SDF rounded border `VkPipeline` for `render_pass`.
+    /// Compiles and initializes both the alpha-blended textured window quad `VkPipeline` and
+    /// the anti-aliased SDF rounded border `VkPipeline` for `render_pass`.
     pub fn init_border_pipeline(
         &mut self,
         device: &ash::Device,
@@ -261,8 +366,60 @@ impl CompositorPipeline {
         }
 
         let (vs_words, fs_words) = compile_border_spirv()?;
+        let (q_vs_words, q_fs_words) = compile_quad_spirv()?;
 
         unsafe {
+            // 1. Sampler + DescriptorSetLayout + DescriptorPool for textured window quads
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            self.sampler = device.create_sampler(&sampler_info, None)?;
+
+            let bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            ];
+            let ds_layout_info =
+                vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            self.quad_desc_layout = device.create_descriptor_set_layout(&ds_layout_info, None)?;
+
+            let pool_sizes = [
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 512,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::SAMPLER,
+                    descriptor_count: 512,
+                },
+            ];
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                .max_sets(512)
+                .pool_sizes(&pool_sizes);
+            self.quad_desc_pool = device.create_descriptor_pool(&pool_info, None)?;
+
+            let quad_pc_ranges = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(std::mem::size_of::<WindowQuadPushConstants>() as u32)];
+            let set_layouts = [self.quad_desc_layout];
+            let quad_layout_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&quad_pc_ranges);
+            self.quad_layout = device.create_pipeline_layout(&quad_layout_info, None)?;
+
             let push_constant_ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
@@ -277,6 +434,11 @@ impl CompositorPipeline {
             let vs_module = device.create_shader_module(&vs_info, None)?;
             let fs_module = device.create_shader_module(&fs_info, None)?;
 
+            let q_vs_info = vk::ShaderModuleCreateInfo::default().code(&q_vs_words);
+            let q_fs_info = vk::ShaderModuleCreateInfo::default().code(&q_fs_words);
+            let q_vs_module = device.create_shader_module(&q_vs_info, None)?;
+            let q_fs_module = device.create_shader_module(&q_fs_info, None)?;
+
             let vs_entry = std::ffi::CString::new("vs_main")?;
             let fs_entry = std::ffi::CString::new("fs_main")?;
 
@@ -288,6 +450,17 @@ impl CompositorPipeline {
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(vk::ShaderStageFlags::FRAGMENT)
                     .module(fs_module)
+                    .name(&fs_entry),
+            ];
+
+            let q_stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(q_vs_module)
+                    .name(&vs_entry),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(q_fs_module)
                     .name(&fs_entry),
             ];
 
@@ -322,32 +495,191 @@ impl CompositorPipeline {
             let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&dynamic_states);
 
-            let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
-                .stages(&stages)
-                .vertex_input_state(&vertex_input)
-                .input_assembly_state(&input_assembly)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&rasterizer)
-                .multisample_state(&multisampling)
-                .color_blend_state(&color_blending)
-                .dynamic_state(&dynamic_state)
-                .layout(self.border_layout)
-                .render_pass(render_pass)
-                .subpass(0)];
+            let pipeline_info = [
+                vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&stages)
+                    .vertex_input_state(&vertex_input)
+                    .input_assembly_state(&input_assembly)
+                    .viewport_state(&viewport_state)
+                    .rasterization_state(&rasterizer)
+                    .multisample_state(&multisampling)
+                    .color_blend_state(&color_blending)
+                    .dynamic_state(&dynamic_state)
+                    .layout(self.border_layout)
+                    .render_pass(render_pass)
+                    .subpass(0),
+                vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&q_stages)
+                    .vertex_input_state(&vertex_input)
+                    .input_assembly_state(&input_assembly)
+                    .viewport_state(&viewport_state)
+                    .rasterization_state(&rasterizer)
+                    .multisample_state(&multisampling)
+                    .color_blend_state(&color_blending)
+                    .dynamic_state(&dynamic_state)
+                    .layout(self.quad_layout)
+                    .render_pass(render_pass)
+                    .subpass(0),
+            ];
 
             let pipelines = device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
                 .map_err(|(_, e)| e)?;
             self.border_pipeline = pipelines[0];
+            self.quad_pipeline = pipelines[1];
 
             device.destroy_shader_module(vs_module, None);
             device.destroy_shader_module(fs_module, None);
+            device.destroy_shader_module(q_vs_module, None);
+            device.destroy_shader_module(q_fs_module, None);
         }
         Ok(())
     }
 
+    /// Allocates and binds a `vk::DescriptorSet` for an imported window `ImageView`.
+    pub fn allocate_texture_descriptor_set(
+        &self,
+        device: &ash::Device,
+        view: vk::ImageView,
+    ) -> Option<vk::DescriptorSet> {
+        if self.quad_desc_pool == vk::DescriptorPool::null()
+            || self.quad_desc_layout == vk::DescriptorSetLayout::null()
+            || self.sampler == vk::Sampler::null()
+            || view == vk::ImageView::null()
+        {
+            return None;
+        }
+        unsafe {
+            let layouts = [self.quad_desc_layout];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.quad_desc_pool)
+                .set_layouts(&layouts);
+            let ds = device.allocate_descriptor_sets(&alloc_info).ok()?[0];
+
+            let img_info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(view)];
+            let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&img_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler_info),
+            ];
+            device.update_descriptor_sets(&writes, &[]);
+            Some(ds)
+        }
+    }
+
+    pub unsafe fn free_texture_descriptor_set(
+        &self,
+        device: &ash::Device,
+        ds: vk::DescriptorSet,
+    ) {
+        if self.quad_desc_pool != vk::DescriptorPool::null() && ds != vk::DescriptorSet::null() {
+            unsafe {
+                let _ = device.free_descriptor_sets(self.quad_desc_pool, &[ds]);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_textured_quad(
+        &self,
+        device: &ash::Device,
+        cmd_buf: vk::CommandBuffer,
+        ds: vk::DescriptorSet,
+        quad: &WindowQuad,
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        radius: i32,
+        force_opaque: bool,
+    ) {
+        if self.quad_pipeline == vk::Pipeline::null()
+            || self.quad_layout == vk::PipelineLayout::null()
+            || ds == vk::DescriptorSet::null()
+        {
+            return;
+        }
+        let local_x = (quad.physics.position.x.round() as i32) - mon_x;
+        let local_y = (quad.physics.position.y.round() as i32) - mon_y;
+        let w = quad.width.round() as i32;
+        let h = quad.height.round() as i32;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let r = radius.clamp(0, (w / 2).min(h / 2));
+
+        let pc = WindowQuadPushConstants {
+            rect: [local_x as f32, local_y as f32, w as f32, h as f32],
+            screen_and_radius: [
+                mon_w.max(1) as f32,
+                mon_h.max(1) as f32,
+                r as f32,
+                if force_opaque { 1.0 } else { 0.0 },
+            ],
+        };
+
+        unsafe {
+            device.cmd_bind_pipeline(
+                cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.quad_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.quad_layout,
+                0,
+                &[ds],
+                &[],
+            );
+            let pc_bytes = std::slice::from_raw_parts(
+                &pc as *const WindowQuadPushConstants as *const u8,
+                std::mem::size_of::<WindowQuadPushConstants>(),
+            );
+            device.cmd_push_constants(
+                cmd_buf,
+                self.quad_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes,
+            );
+            device.cmd_draw(cmd_buf, 6, 1, 0, 0);
+        }
+    }
+
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
+            if self.quad_pipeline != vk::Pipeline::null() {
+                device.destroy_pipeline(self.quad_pipeline, None);
+                self.quad_pipeline = vk::Pipeline::null();
+            }
+            if self.quad_layout != vk::PipelineLayout::null() {
+                device.destroy_pipeline_layout(self.quad_layout, None);
+                self.quad_layout = vk::PipelineLayout::null();
+            }
+            if self.quad_desc_pool != vk::DescriptorPool::null() {
+                device.destroy_descriptor_pool(self.quad_desc_pool, None);
+                self.quad_desc_pool = vk::DescriptorPool::null();
+            }
+            if self.quad_desc_layout != vk::DescriptorSetLayout::null() {
+                device.destroy_descriptor_set_layout(self.quad_desc_layout, None);
+                self.quad_desc_layout = vk::DescriptorSetLayout::null();
+            }
+            if self.sampler != vk::Sampler::null() {
+                device.destroy_sampler(self.sampler, None);
+                self.sampler = vk::Sampler::null();
+            }
             if self.border_pipeline != vk::Pipeline::null() {
                 device.destroy_pipeline(self.border_pipeline, None);
                 self.border_pipeline = vk::Pipeline::null();
@@ -507,7 +839,6 @@ impl CompositorPipeline {
     /// Records the anti-aliased macOS shadowless dual-rim border using the SDF graphics pipeline:
     /// - Outer perimeter: 1px anti-aliased stroke (`0 0 0 1px`) with corner radius (12px default).
     /// - Inner top: 1px anti-aliased specular bevel (`inset 0 1px 0 0`) along the inside top edge & corners.
-    /// - Corner clip mask: Smoothly clips sharp 90-degree blitted window texture corners outside the rounded arc.
     pub fn record_mac_dual_rim_border(
         &self,
         device: &ash::Device,
@@ -520,6 +851,27 @@ impl CompositorPipeline {
         colors: MacBorderColors,
         radius: i32,
     ) {
+        self.record_mac_dual_rim_border_ex(
+            device, cmd_buf, quad, mon_x, mon_y, mon_w, mon_h, colors, radius, false,
+        );
+    }
+
+    /// Records the anti-aliased macOS shadowless dual-rim border, or a bottom-only 1px border
+    /// with 0 radius when `bottom_only == true` (for docked non-floating `roobar`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_mac_dual_rim_border_ex(
+        &self,
+        device: &ash::Device,
+        cmd_buf: vk::CommandBuffer,
+        quad: &WindowQuad,
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        colors: MacBorderColors,
+        radius: i32,
+        bottom_only: bool,
+    ) {
         let local_x = (quad.physics.position.x.round() as i32) - mon_x;
         let local_y = (quad.physics.position.y.round() as i32) - mon_y;
         let w = quad.width.round() as i32;
@@ -527,14 +879,23 @@ impl CompositorPipeline {
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = radius.clamp(0, (w / 2).min(h / 2));
+        let r = if bottom_only {
+            0
+        } else {
+            radius.clamp(0, (w / 2).min(h / 2))
+        };
 
         if self.border_pipeline != vk::Pipeline::null()
             && self.border_layout != vk::PipelineLayout::null()
         {
             let pc = BorderPushConstants {
                 rect: [local_x as f32, local_y as f32, w as f32, h as f32],
-                screen_and_radius: [mon_w.max(1) as f32, mon_h.max(1) as f32, r as f32, 0.0],
+                screen_and_radius: [
+                    mon_w.max(1) as f32,
+                    mon_h.max(1) as f32,
+                    r as f32,
+                    if bottom_only { 1.0 } else { 0.0 },
+                ],
                 outer_color: colors.outer,
                 inner_top_color: colors.inner_top,
                 corner_mask_color: colors.corner_mask,
