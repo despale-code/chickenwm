@@ -16,9 +16,9 @@ use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetLayeredWindowAttributes,
     SetWindowDisplayAffinity, SetWindowPos, ShowWindow, HTTRANSPARENT, HWND_BOTTOM, HWND_TOPMOST,
-    LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNA, WDA_EXCLUDEFROMCAPTURE,
-    WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    LWA_ALPHA, LWA_COLORKEY, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNA,
+    WDA_EXCLUDEFROMCAPTURE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 /// Metadata for a physical display enumerated via `EnumDisplayMonitors`.
@@ -137,7 +137,9 @@ pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> 
             None,
         )?;
 
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 254, LWA_ALPHA);
+        // Use LWA_COLORKEY (RGB 0,0,0 -> transparent) in normal desktop mode so the opaque
+        // Win32 Vulkan swapchain never blacks out the desktop when cleared to [0, 0, 0, 0].
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY);
         let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,
@@ -170,9 +172,25 @@ pub struct MonitorSwapchain {
     pub image_available_sem: vk::Semaphore,
     pub render_finished_sem: vk::Semaphore,
     pub in_flight_fence: vk::Fence,
+    pub opaque_backdrop: bool,
 }
 
 impl MonitorSwapchain {
+    /// Switches between colorkey transparency (`LWA_COLORKEY` for normal desktop border-only mode)
+    /// and full-surface alpha (`LWA_ALPHA` for Exposé Overview / Lock Screen backdrop mode).
+    pub fn set_opaque_backdrop(&mut self, opaque: bool) {
+        if self.opaque_backdrop != opaque {
+            self.opaque_backdrop = opaque;
+            if !self.hwnd.0.is_null() {
+                unsafe {
+                    let flags = if opaque { LWA_ALPHA } else { LWA_COLORKEY };
+                    let alpha = if opaque { 254 } else { 255 };
+                    let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, flags);
+                }
+            }
+        }
+    }
+
     /// Creates an independent swapchain wrapper (lightweight constructor when Vulkan context is not yet attached).
     pub fn new(monitor: HMONITOR, width: u32, height: u32, refresh_rate_hz: u32) -> Result<Self> {
         Ok(Self {
@@ -192,6 +210,7 @@ impl MonitorSwapchain {
             image_available_sem: vk::Semaphore::null(),
             render_finished_sem: vk::Semaphore::null(),
             in_flight_fence: vk::Fence::null(),
+            opaque_backdrop: false,
         })
     }
 
@@ -270,6 +289,7 @@ impl MonitorSwapchain {
                 image_available_sem,
                 render_finished_sem,
                 in_flight_fence,
+                opaque_backdrop: false,
             };
             sc.recreate_with_vulkan(ctx, info.width, info.height)?;
             Ok(sc)

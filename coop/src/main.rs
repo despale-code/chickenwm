@@ -912,7 +912,9 @@ async fn main() -> Result<()> {
 
         if expose.active {
             expose.transition_progress = (expose.transition_progress + dt * 6.0).min(1.0);
-        } else if !expose_returning {
+        } else if expose_returning {
+            expose.transition_progress = (expose.transition_progress - dt * 5.0).max(0.0);
+        } else {
             expose.transition_progress = 0.0;
         }
 
@@ -925,12 +927,13 @@ async fn main() -> Result<()> {
             } else if show_expose_backdrop {
                 [0.05, 0.05, 0.08, 0.94] // Opaque dimmed backdrop so native Win32 windows underneath don't bleed through Exposé gaps
             } else {
-                [0.0, 0.0, 0.0, 0.0] // Transparent clear so desktop wallpaper & transparent surfaces never turn black
+                [0.0, 0.0, 0.0, 0.0] // Transparent clear (colorkeyed out via LWA_COLORKEY) so desktop & windows never turn black
             };
 
             let active_popups = HierarchyTracker::active_popups();
 
             for (idx, sc) in swapchains.iter_mut().enumerate() {
+                sc.set_opaque_backdrop(locked || show_expose_backdrop);
                 let (mon_x, mon_y) = monitor_origins.get(idx).copied().unwrap_or((0, 0));
                 let mon_w = sc.width;
                 let mon_h = sc.height;
