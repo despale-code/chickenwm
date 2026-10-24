@@ -240,27 +240,59 @@ fn classify_window_role(hwnd: HWND) -> WindowRole {
 }
 
 /// Returns the actual visible frame bounds of `hwnd`, excluding invisible Win10/Win11 drop-shadow padding.
+/// Uses synchronous `GetWindowRect` combined with cached steady-state DWM shadow margins so bounds
+/// update with 0ms latency during live window scaling without waiting for async DWM frame commits.
 fn get_window_extended_bounds(hwnd: HWND) -> Option<RECT> {
+    static MARGIN_CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<isize, [i32; 4]>>> =
+        std::sync::OnceLock::new();
+    let cache = MARGIN_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+
     unsafe {
-        let mut rc = RECT::default();
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut rc as *mut _ as *mut core::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
-        )
-        .is_ok()
-        {
-            if (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0 {
-                return Some(rc);
-            }
+        let mut win_rc = RECT::default();
+        if GetWindowRect(hwnd, &mut win_rc).is_err() {
+            return None;
         }
-        if GetWindowRect(hwnd, &mut rc).is_ok() {
-            if (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0 {
-                return Some(rc);
-            }
+        if (win_rc.right - win_rc.left) <= 0 || (win_rc.bottom - win_rc.top) <= 0 {
+            return None;
         }
-        None
+        let key = hwnd.0 as isize;
+        let margins = if let Some(&m) = cache.lock().get(&key) {
+            m
+        } else {
+            let mut ext_rc = RECT::default();
+            let m = if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut ext_rc as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok()
+                && (ext_rc.right - ext_rc.left) > 0
+                && (ext_rc.bottom - ext_rc.top) > 0
+            {
+                let l = (ext_rc.left - win_rc.left).clamp(0, 12);
+                let t = (ext_rc.top - win_rc.top).clamp(0, 12);
+                let r = (win_rc.right - ext_rc.right).clamp(0, 12);
+                let b = (win_rc.bottom - ext_rc.bottom).clamp(0, 12);
+                let sym_x = l.min(r);
+                [sym_x, t, sym_x, b]
+            } else {
+                [0, 0, 0, 0]
+            };
+            cache.lock().insert(key, m);
+            m
+        };
+        let rc = RECT {
+            left: win_rc.left + margins[0],
+            top: win_rc.top + margins[1],
+            right: win_rc.right - margins[2],
+            bottom: win_rc.bottom - margins[3],
+        };
+        if (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0 {
+            Some(rc)
+        } else {
+            Some(win_rc)
+        }
     }
 }
 
@@ -805,24 +837,13 @@ async fn main() -> Result<()> {
             }
         } else {
             hovered_expose_key = None;
-            if !lbutton_down {
-                if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
-                    if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
-                        fg_entry.native_rect = rc;
-                        fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
-                        fg_entry.quad.size_physics.target = Vec2::new(
-                            (rc.right - rc.left).max(1) as f32,
-                            (rc.bottom - rc.top).max(1) as f32,
-                        );
-                    }
-                }
-            }
         }
 
         wallpaper.tick(dt);
+        let in_expose_transition = expose.active || expose.transition_progress > 0.01;
         let mut expose_returning = false;
         for entry in managed_windows.values_mut() {
-            if !expose.active && lbutton_down && entry.role != WindowRole::Desktop {
+            if !expose.active && entry.role != WindowRole::Desktop {
                 if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
                     entry.native_rect = rc;
                     let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
@@ -835,40 +856,43 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if let Some(ref cdev) = capture_dev {
-                let _ = entry.capture.poll_next_frame(cdev);
-                if entry.capture.handle_recreated {
-                    entry.capture.handle_recreated = false;
-                    if let Some(ref ctx) = vk_ctx {
-                        if let Some(ds) = entry.descriptor_set.take() {
-                            unsafe {
-                                pipeline.free_texture_descriptor_set(&ctx.device, ds);
+            if in_expose_transition || !entry.capture.has_frame {
+                if let Some(ref cdev) = capture_dev {
+                    let _ = entry.capture.poll_next_frame(cdev);
+                    if entry.capture.handle_recreated {
+                        entry.capture.handle_recreated = false;
+                        if let Some(ref ctx) = vk_ctx {
+                            if let Some(ds) = entry.descriptor_set.take() {
+                                unsafe {
+                                    pipeline.free_texture_descriptor_set(&ctx.device, ds);
+                                }
                             }
-                        }
-                        if let Some(mut old_tex) = entry.vk_tex.take() {
-                            unsafe {
-                                ctx.wait_idle();
-                                old_tex.destroy(&ctx.device);
+                            if let Some(mut old_tex) = entry.vk_tex.take() {
+                                unsafe {
+                                    ctx.wait_idle();
+                                    old_tex.destroy(&ctx.device);
+                                }
                             }
+                            entry.vk_tex = ctx
+                                .import_dxgi_texture(
+                                    entry.capture.shared_handle,
+                                    entry.capture.capacity_w,
+                                    entry.capture.capacity_h,
+                                )
+                                .ok();
+                            entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
+                                pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
+                            });
                         }
-                        entry.vk_tex = ctx
-                            .import_dxgi_texture(
-                                entry.capture.shared_handle,
-                                entry.capture.capacity_w,
-                                entry.capture.capacity_h,
-                            )
-                            .ok();
-                        entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
-                            pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
-                        });
                     }
                 }
             }
 
-            if (lbutton_down && !expose.active)
+            if !in_expose_transition
+                || (lbutton_down && !expose.active)
                 || matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay | WindowRole::Desktop)
             {
-                // Keep locked to target position during real-time mouse drag/resize or for roobar/overlays
+                // Keep locked 1:1 to real window geometry in normal desktop mode so scaling/resizing has 0ms lag
                 entry.quad.physics.position = entry.quad.physics.target;
                 entry.quad.physics.velocity = Vec2::default();
                 entry.quad.size_physics.position = entry.quad.size_physics.target;
@@ -914,7 +938,7 @@ async fn main() -> Result<()> {
                     ctx,
                     clear_rgba,
                     |cmd_buf, _dst_img| {
-                        if !locked {
+                        if !locked && show_expose_backdrop {
                             // Transition all captured window textures to SHADER_READ_ONLY_OPTIMAL for alpha-blended sampling
                             for key in &z_ordered_keys {
                                 if let Some(entry) = managed_windows.get(key) {
@@ -963,7 +987,7 @@ async fn main() -> Result<()> {
                                     let Some(entry) = managed_windows.get(key) else {
                                         continue;
                                     };
-                                    if !entry.capture.has_frame {
+                                    if show_expose_backdrop && !entry.capture.has_frame {
                                         continue;
                                     }
                                     let in_pass = match pass {
@@ -993,32 +1017,34 @@ async fn main() -> Result<()> {
                                     let force_opaque =
                                         matches!(entry.role, WindowRole::Tiled | WindowRole::Desktop);
 
-                                    if let Some(ds) = entry.descriptor_set {
-                                        let uv_scale = if let Some(ref tex) = entry.vk_tex {
-                                            [
-                                                (entry.capture.width as f32
-                                                    / tex.width.max(1) as f32)
-                                                    .clamp(0.0, 1.0),
-                                                (entry.capture.height as f32
-                                                    / tex.height.max(1) as f32)
-                                                    .clamp(0.0, 1.0),
-                                            ]
-                                        } else {
-                                            [1.0, 1.0]
-                                        };
-                                        pipeline.record_textured_quad(
-                                            device,
-                                            cmd_buf,
-                                            ds,
-                                            &entry.quad,
-                                            mon_x,
-                                            mon_y,
-                                            mon_w,
-                                            mon_h,
-                                            quad_radius,
-                                            force_opaque,
-                                            uv_scale,
-                                        );
+                                    if show_expose_backdrop {
+                                        if let Some(ds) = entry.descriptor_set {
+                                            let uv_scale = if let Some(ref tex) = entry.vk_tex {
+                                                [
+                                                    (entry.capture.width as f32
+                                                        / tex.width.max(1) as f32)
+                                                        .clamp(0.0, 1.0),
+                                                    (entry.capture.height as f32
+                                                        / tex.height.max(1) as f32)
+                                                        .clamp(0.0, 1.0),
+                                                ]
+                                            } else {
+                                                [1.0, 1.0]
+                                            };
+                                            pipeline.record_textured_quad(
+                                                device,
+                                                cmd_buf,
+                                                ds,
+                                                &entry.quad,
+                                                mon_x,
+                                                mon_y,
+                                                mon_w,
+                                                mon_h,
+                                                quad_radius,
+                                                force_opaque,
+                                                uv_scale,
+                                            );
+                                        }
                                     }
 
                                     match entry.role {
