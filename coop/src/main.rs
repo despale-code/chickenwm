@@ -22,13 +22,16 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetShellWindow,
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, PeekMessageW, TranslateMessage,
-    GWL_EXSTYLE, MSG, PM_REMOVE, WS_EX_TOOLWINDOW,
+    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, PeekMessageW, SetWindowLongW,
+    SetWindowPos, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, MSG, PM_REMOVE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_THICKFRAME,
 };
 
 struct ManagedWindow {
@@ -59,6 +62,52 @@ fn get_window_extended_bounds(hwnd: HWND) -> Option<RECT> {
             }
         }
         None
+    }
+}
+
+/// Hides Windows 11's native 1px DWM border (`DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`), clears any
+/// bogus white `DWMWA_CAPTION_COLOR` override, and restores `WS_CAPTION | WS_THICKFRAME` if it was
+/// previously stripped on a non-popup window (preventing the Win95 fallback titlebar and thick grey frame).
+fn heal_native_window_frame(hwnd: HWND) {
+    unsafe {
+        if hwnd == GetShellWindow() {
+            return;
+        }
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE (valid only for DWMWA_BORDER_COLOR)
+        let default_color: u32 = 0xFFFF_FFFF; // DWMWA_COLOR_DEFAULT
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &none as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(35), // DWMWA_CAPTION_COLOR
+            &default_color as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(36), // DWMWA_TEXT_COLOR
+            &default_color as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        let cur = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
+        if (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur | frame) as i32);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
     }
 }
 
@@ -271,6 +320,7 @@ async fn main() -> Result<()> {
                     entry.quad.update_targets(Vec2::new(x, y), Vec2::new(w, h));
                     entry.quad.z_order = z_idx as i32;
                 } else if !failed_hwnds.contains(&key) {
+                    heal_native_window_frame(hwnd);
                     if let Some(ref cdev) = capture_dev {
                         match WindowCaptureSession::start_with_device(hwnd, cdev) {
                             Ok(cap) => {
