@@ -1047,17 +1047,49 @@ impl ExposeOverview {
         }
         let cols = (total as f32).sqrt().ceil() as usize;
         let rows = total.div_ceil(cols);
-        let pad = 32.0;
+        let pad = 36.0;
+        let top_inset = 48.0;
+        let avail_h = (mon_h - top_inset).max(200.0);
 
         let cell_w = (mon_w - pad * (cols as f32 + 1.0)) / cols as f32;
-        let cell_h = (mon_h - pad * (rows as f32 + 1.0)) / rows as f32;
+        let cell_h = (avail_h - pad * (rows as f32 + 1.0)) / rows as f32;
 
         let col = index % cols;
         let row = index / cols;
+        let items_in_row = if row + 1 == rows {
+            total - row * cols
+        } else {
+            cols
+        };
+        let row_total_w = items_in_row as f32 * cell_w + (items_in_row.saturating_sub(1)) as f32 * pad;
+        let row_start_x = ((mon_w - row_total_w) * 0.5).max(pad);
 
-        let x = pad + col as f32 * (cell_w + pad);
-        let y = pad + row as f32 * (cell_h + pad);
+        let x = row_start_x + col as f32 * (cell_w + pad);
+        let y = top_inset + pad + row as f32 * (cell_h + pad);
         (x, y, cell_w.max(64.0), cell_h.max(64.0))
+    }
+
+    /// Computes an aspect-ratio-preserving `(x, y, width, height)` card inside the Exposé grid slot
+    /// for a window of native size `(win_w, win_h)`.
+    pub fn compute_slot_fitted(
+        &self,
+        index: usize,
+        total: usize,
+        mon_w: f32,
+        mon_h: f32,
+        win_w: f32,
+        win_h: f32,
+    ) -> (f32, f32, f32, f32) {
+        let (cell_x, cell_y, cell_w, cell_h) = self.compute_slot(index, total, mon_w, mon_h);
+        let ww = win_w.max(64.0);
+        let hh = win_h.max(64.0);
+        let max_scale = if total <= 1 { 0.78 } else { 0.94 };
+        let scale = (cell_w / ww).min(cell_h / hh).min(max_scale);
+        let w = (ww * scale).max(64.0);
+        let h = (hh * scale).max(64.0);
+        let x = cell_x + (cell_w - w) * 0.5;
+        let y = cell_y + (cell_h - h) * 0.5;
+        (x, y, w, h)
     }
 }
 

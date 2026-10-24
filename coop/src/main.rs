@@ -28,17 +28,24 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_TAB,
+    GetAsyncKeyState, RegisterHotKey, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_WIN, VIRTUAL_KEY, VK_CONTROL,
+    VK_ESCAPE, VK_LBUTTON, VK_LWIN, VK_MENU, VK_RBUTTON, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetPropW, GetShellWindow,
-    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, IsIconic, IsWindowVisible,
-    PeekMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, TranslateMessage, GWL_EXSTYLE,
+    AllowSetForegroundWindow, BringWindowToTop, DispatchMessageW, EnumWindows, GetClassNameW,
+    GetForegroundWindow, GetPropW, GetShellWindow, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW,
+    SetForegroundWindow, SetWindowLongW, SetWindowPos, TranslateMessage, ASFW_ANY, GWL_EXSTYLE,
     GWL_STYLE, GW_OWNER, MSG, PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    SWP_NOZORDER, WM_HOTKEY, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
+
+const HOTKEY_ID_EXPOSE_WIN_TAB: i32 = 0x7C01;
+const HOTKEY_ID_EXPOSE_CTRL_ALT_TAB: i32 = 0x7C02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowRole {
@@ -55,6 +62,100 @@ struct ManagedWindow {
     vk_tex: Option<ImportedVulkanTexture>,
     descriptor_set: Option<vk::DescriptorSet>,
     role: WindowRole,
+    native_rect: RECT,
+}
+
+fn set_canvas_passthrough(canvas_hwnds: &[HWND], passthrough: bool) {
+    unsafe {
+        for &hwnd in canvas_hwnds {
+            if hwnd.0.is_null() {
+                continue;
+            }
+            let cur = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let next = if passthrough {
+                cur | WS_EX_TRANSPARENT.0
+            } else {
+                cur & !WS_EX_TRANSPARENT.0
+            };
+            if next != cur {
+                let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next as i32);
+            }
+        }
+    }
+}
+
+fn force_focus_window(hwnd: HWND) {
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
+        let fg = GetForegroundWindow();
+        if fg == hwnd {
+            return;
+        }
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let cur_tid = GetCurrentThreadId();
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+
+        let attached_fg = if fg_tid != 0 && fg_tid != cur_tid {
+            AttachThreadInput(cur_tid, fg_tid, true).as_bool()
+        } else {
+            false
+        };
+        let attached_target = if target_tid != 0 && target_tid != cur_tid && target_tid != fg_tid {
+            AttachThreadInput(cur_tid, target_tid, true).as_bool()
+        } else {
+            false
+        };
+        let attached_fg_target = if fg_tid != 0 && target_tid != 0 && fg_tid != target_tid {
+            AttachThreadInput(fg_tid, target_tid, true).as_bool()
+        } else {
+            false
+        };
+
+        let _ = BringWindowToTop(hwnd);
+        if !SetForegroundWindow(hwnd).as_bool() {
+            let inputs = [
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0xFF),
+                            wScan: 0,
+                            dwFlags: Default::default(),
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                },
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(0xFF),
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                },
+            ];
+            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            let _ = SetForegroundWindow(hwnd);
+        }
+
+        if attached_fg_target {
+            let _ = AttachThreadInput(fg_tid, target_tid, false);
+        }
+        if attached_target {
+            let _ = AttachThreadInput(cur_tid, target_tid, false);
+        }
+        if attached_fg {
+            let _ = AttachThreadInput(cur_tid, fg_tid, false);
+        }
+    }
 }
 
 fn get_window_title(hwnd: HWND) -> String {
@@ -391,10 +492,30 @@ async fn main() -> Result<()> {
     let mut wallpaper = WallpaperLayer::new();
     let mut expose = ExposeOverview::new();
     let mut expose_chord_held = false;
+    let mut esc_held = false;
+    let mut was_lmb_down = false;
+    let mut suppress_drag_until_release = false;
+    let mut canvas_passthrough_active = true;
+    let mut hovered_expose_key: Option<isize>;
     let mut managed_windows: HashMap<isize, ManagedWindow> = HashMap::new();
     let mut failed_hwnds: HashSet<isize> = HashSet::new();
     let mut z_ordered_keys: Vec<isize> = Vec::new();
     let mut last_enum = Instant::now() - Duration::from_secs(1);
+
+    unsafe {
+        let _ = RegisterHotKey(
+            None,
+            HOTKEY_ID_EXPOSE_WIN_TAB,
+            MOD_WIN | MOD_NOREPEAT,
+            VK_TAB.0 as u32,
+        );
+        let _ = RegisterHotKey(
+            None,
+            HOTKEY_ID_EXPOSE_CTRL_ALT_TAB,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            VK_TAB.0 as u32,
+        );
+    }
 
     let pacer = chickenwm_core::frame_scheduler::FramePacerControl::new(config_fps_limit, false);
     pacer.set_monitor_native_hz(max_hz);
@@ -417,9 +538,16 @@ async fn main() -> Result<()> {
             break;
         }
 
+        let mut hotkey_toggled = false;
         unsafe {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_HOTKEY
+                    && (msg.wParam.0 as i32 == HOTKEY_ID_EXPOSE_WIN_TAB
+                        || msg.wParam.0 as i32 == HOTKEY_ID_EXPOSE_CTRL_ALT_TAB)
+                {
+                    hotkey_toggled = true;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -455,6 +583,7 @@ async fn main() -> Result<()> {
                 let role = classify_window_role(hwnd);
 
                 if let Some(entry) = managed_windows.get_mut(&key) {
+                    entry.native_rect = rc;
                     if !expose.active
                         || !matches!(role, WindowRole::Tiled | WindowRole::Floating)
                     {
@@ -500,6 +629,7 @@ async fn main() -> Result<()> {
                                         vk_tex,
                                         descriptor_set,
                                         role,
+                                        native_rect: rc,
                                     },
                                 );
                             }
@@ -551,29 +681,55 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Phase 3.5: Toggle Exposé bird's-eye overview on Ctrl + Alt + Tab
-        let ctrl_alt_tab = unsafe {
-            GetAsyncKeyState(VK_CONTROL.0 as i32) < 0
-                && GetAsyncKeyState(VK_MENU.0 as i32) < 0
-                && GetAsyncKeyState(VK_TAB.0 as i32) < 0
+        // Phase 3.5: Toggle Exposé bird's-eye overview on Super + Tab or Ctrl + Alt + Tab
+        let chord_down = unsafe {
+            let tab = GetAsyncKeyState(VK_TAB.0 as i32) < 0;
+            let ctrl_alt = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0
+                && GetAsyncKeyState(VK_MENU.0 as i32) < 0;
+            let super_down = (GetAsyncKeyState(VK_LWIN.0 as i32) < 0
+                || GetAsyncKeyState(VK_RWIN.0 as i32) < 0)
+                && GetAsyncKeyState(VK_SHIFT.0 as i32) >= 0
+                && GetAsyncKeyState(VK_MENU.0 as i32) >= 0;
+            tab && (ctrl_alt || super_down)
         };
-        if ctrl_alt_tab && !expose_chord_held {
+        let esc_down = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 };
+
+        if (chord_down && !expose_chord_held) || hotkey_toggled {
             expose.toggle();
             if !expose.active {
                 last_enum = now - Duration::from_secs(1);
             }
             tracing::info!("Exposé overview toggled: active={}", expose.active);
+        } else if expose.active && esc_down && !esc_held {
+            expose.active = false;
+            last_enum = now - Duration::from_secs(1);
+            tracing::info!("Exposé overview dismissed via Escape");
         }
-        expose_chord_held = ctrl_alt_tab;
+        expose_chord_held = chord_down;
+        esc_held = esc_down;
 
         // Poll latest WGC frames and step spring-damper physics for all tracked windows
         let fg_hwnd = unsafe { GetForegroundWindow() };
-        let lbutton_down = unsafe {
-            GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
-        };
+        let lmb_only = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+        let rmb_only = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
+        let lmb_just_pressed = lmb_only && !was_lmb_down;
+        was_lmb_down = lmb_only;
+        if !lmb_only && !rmb_only {
+            suppress_drag_until_release = false;
+        }
+        let lbutton_down = (lmb_only || rmb_only) && !suppress_drag_until_release;
+
+        // Intercept mouse clicks on the canvas while Exposé is active so clicks don't hit underlying windows
+        let want_passthrough = !expose.active && !suppress_drag_until_release;
+        if want_passthrough != canvas_passthrough_active {
+            set_canvas_passthrough(&canvas_hwnds, want_passthrough);
+            canvas_passthrough_active = want_passthrough;
+        }
+
+        let (cx, cy) = sync_os_cursor_pos();
 
         if expose.active {
-            let expose_keys: Vec<isize> = z_ordered_keys
+            let mut expose_keys: Vec<isize> = z_ordered_keys
                 .iter()
                 .copied()
                 .filter(|k| {
@@ -582,6 +738,14 @@ async fn main() -> Result<()> {
                         .is_some_and(|e| matches!(e.role, WindowRole::Tiled | WindowRole::Floating))
                 })
                 .collect();
+            // Sort spatially by native screen rect so grid slots never jump when Z-order changes
+            expose_keys.sort_by_key(|k| {
+                managed_windows
+                    .get(k)
+                    .map(|e| (e.native_rect.top / 120, e.native_rect.left / 120, *k))
+                    .unwrap_or((0, 0, *k))
+            });
+
             let total = expose_keys.len();
             let (mon_x, mon_y) = monitor_origins.first().copied().unwrap_or((0, 0));
             let (mon_w, mon_h) = swapchains
@@ -589,46 +753,78 @@ async fn main() -> Result<()> {
                 .map(|s| (s.width as f32, s.height as f32))
                 .unwrap_or((1920.0, 1080.0));
 
+            hovered_expose_key = expose_keys
+                .iter()
+                .copied()
+                .find(|k| {
+                    managed_windows
+                        .get(k)
+                        .is_some_and(|e| e.quad.hit_test(cx as f32, cy as f32))
+                });
+
             for (slot_idx, key) in expose_keys.iter().enumerate() {
                 if let Some(entry) = managed_windows.get_mut(key) {
-                    let (sx, sy, sw, sh) = expose.compute_slot(slot_idx, total, mon_w, mon_h);
+                    let nat_w = (entry.native_rect.right - entry.native_rect.left).max(64) as f32;
+                    let nat_h = (entry.native_rect.bottom - entry.native_rect.top).max(64) as f32;
+                    let (mut sx, mut sy, mut sw, mut sh) =
+                        expose.compute_slot_fitted(slot_idx, total, mon_w, mon_h, nat_w, nat_h);
+                    if hovered_expose_key == Some(*key) {
+                        let boost = 1.035;
+                        let nw = sw * boost;
+                        let nh = sh * boost;
+                        sx -= (nw - sw) * 0.5;
+                        sy -= (nh - sh) * 0.5;
+                        sw = nw;
+                        sh = nh;
+                    }
                     entry.quad.physics.target = Vec2::new(mon_x as f32 + sx, mon_y as f32 + sy);
                     entry.quad.size_physics.target = Vec2::new(sw, sh);
                 }
             }
 
-            if lbutton_down {
-                let (cx, cy) = GLOBAL_CURSOR.get();
-                if let Some(&clicked_key) = expose_keys.iter().rev().find(|&&k| {
-                    managed_windows
-                        .get(&k)
-                        .is_some_and(|e| e.quad.hit_test(cx as f32, cy as f32))
-                }) {
+            if lmb_just_pressed {
+                if let Some(clicked_key) = hovered_expose_key {
                     if let Some(entry) = managed_windows.get(&clicked_key) {
-                        unsafe {
-                            let _ = SetForegroundWindow(entry.quad.hwnd);
-                        }
+                        force_focus_window(entry.quad.hwnd);
                     }
-                    expose.active = false;
-                    last_enum = now - Duration::from_secs(1);
+                }
+                expose.active = false;
+                hovered_expose_key = None;
+                suppress_drag_until_release = true;
+                last_enum = now - Duration::from_secs(1);
+                for entry in managed_windows.values_mut() {
+                    if matches!(entry.role, WindowRole::Tiled | WindowRole::Floating) {
+                        let rc = entry.native_rect;
+                        entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
+                        entry.quad.size_physics.target = Vec2::new(
+                            (rc.right - rc.left).max(1) as f32,
+                            (rc.bottom - rc.top).max(1) as f32,
+                        );
+                    }
                 }
             }
-        } else if !lbutton_down {
-            if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
-                if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
-                    fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
-                    fg_entry.quad.size_physics.target = Vec2::new(
-                        (rc.right - rc.left).max(1) as f32,
-                        (rc.bottom - rc.top).max(1) as f32,
-                    );
+        } else {
+            hovered_expose_key = None;
+            if !lbutton_down {
+                if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
+                    if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
+                        fg_entry.native_rect = rc;
+                        fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
+                        fg_entry.quad.size_physics.target = Vec2::new(
+                            (rc.right - rc.left).max(1) as f32,
+                            (rc.bottom - rc.top).max(1) as f32,
+                        );
+                    }
                 }
             }
         }
 
         wallpaper.tick(dt);
+        let mut expose_returning = false;
         for entry in managed_windows.values_mut() {
             if !expose.active && lbutton_down && entry.role != WindowRole::Desktop {
                 if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
+                    entry.native_rect = rc;
                     let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
                     let target_size = Vec2::new(
                         (rc.right - rc.left).max(1) as f32,
@@ -681,14 +877,28 @@ async fn main() -> Result<()> {
                 entry.quad.height = entry.quad.size_physics.target.y;
             } else {
                 entry.quad.step(dt);
+                if matches!(entry.role, WindowRole::Tiled | WindowRole::Floating)
+                    && (!entry.quad.physics.is_settled() || !entry.quad.size_physics.is_settled())
+                {
+                    expose_returning = true;
+                }
             }
+        }
+
+        if expose.active {
+            expose.transition_progress = (expose.transition_progress + dt * 6.0).min(1.0);
+        } else if !expose_returning {
+            expose.transition_progress = 0.0;
         }
 
         // Render and present across all monitor Vulkan swapchains
         if let Some(ref ctx) = vk_ctx {
             let locked = SESSION_LOCKED.load(Ordering::Acquire);
+            let show_expose_backdrop = expose.active || expose.transition_progress > 0.01;
             let clear_rgba = if locked {
                 [0.04, 0.04, 0.07, 1.0]
+            } else if show_expose_backdrop {
+                [0.05, 0.05, 0.08, 0.94] // Opaque dimmed backdrop so native Win32 windows underneath don't bleed through Exposé gaps
             } else {
                 [0.0, 0.0, 0.0, 0.0] // Transparent clear so desktop wallpaper & transparent surfaces never turn black
             };
@@ -747,14 +957,32 @@ async fn main() -> Result<()> {
                             let focused_colors = MacBorderColors::for_state(theme_mode, true);
                             let popup_colors = MacBorderColors::for_state(theme_mode, true);
 
-                            // Draw all windows in back-to-front Z-order with premultiplied alpha blending
-                            for key in &z_ordered_keys {
-                                if let Some(entry) = managed_windows.get(key) {
+                            // Layer 0: Desktop, Layer 1: Tiled & Floating, Layer 2: Roobar & Overlays (always on top)
+                            for pass in 0..3 {
+                                for key in &z_ordered_keys {
+                                    let Some(entry) = managed_windows.get(key) else {
+                                        continue;
+                                    };
                                     if !entry.capture.has_frame {
                                         continue;
                                     }
-                                    let is_focused = *key == (fg_hwnd.0 as isize);
-                                    let is_tiled = entry.role == WindowRole::Tiled;
+                                    let in_pass = match pass {
+                                        0 => entry.role == WindowRole::Desktop && !show_expose_backdrop,
+                                        1 => matches!(entry.role, WindowRole::Tiled | WindowRole::Floating),
+                                        _ => matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay),
+                                    };
+                                    if !in_pass {
+                                        continue;
+                                    }
+
+                                    let is_focused = if expose.active {
+                                        hovered_expose_key == Some(*key)
+                                            || (hovered_expose_key.is_none() && *key == (fg_hwnd.0 as isize))
+                                    } else {
+                                        *key == (fg_hwnd.0 as isize)
+                                    };
+                                    let is_tiled = entry.role == WindowRole::Tiled
+                                        || (expose.active && entry.role == WindowRole::Floating);
                                     let quad_radius = if is_tiled {
                                         corner_radius
                                     } else if entry.role == WindowRole::TransparentOverlay {
@@ -794,12 +1022,9 @@ async fn main() -> Result<()> {
                                     }
 
                                     match entry.role {
-                                        WindowRole::Desktop
-                                        | WindowRole::TransparentOverlay
-                                        | WindowRole::Floating => {}
+                                        WindowRole::Desktop | WindowRole::TransparentOverlay => {}
+                                        WindowRole::Floating if !expose.active => {}
                                         WindowRole::Roobar => {
-                                            // Roobar, when not floating (docked full monitor width),
-                                            // only renders border on bottom and has 0 border radius.
                                             let bar_w = entry.quad.width.round() as i32;
                                             let bar_x = (entry.quad.physics.position.x.round() as i32) - mon_x;
                                             let is_docked = bar_x <= 2 && bar_w >= (mon_w as i32 - 4);
@@ -818,7 +1043,7 @@ async fn main() -> Result<()> {
                                                 );
                                             }
                                         }
-                                        WindowRole::Tiled => {
+                                        WindowRole::Tiled | WindowRole::Floating => {
                                             let colors = if is_focused {
                                                 focused_colors
                                             } else {
@@ -835,7 +1060,7 @@ async fn main() -> Result<()> {
                                                 colors,
                                                 corner_radius,
                                             );
-                                            if is_focused {
+                                            if is_focused && !expose.active {
                                                 for popup in &active_popups {
                                                     let pquad =
                                                         HierarchyTracker::compute_relative_popup_quad(
@@ -866,7 +1091,6 @@ async fn main() -> Result<()> {
         }
 
         // Phase 5.1 & 5.2: Evaluate hit-testing synchronously at VSync rate
-        sync_os_cursor_pos();
         if let Some((cx, cy)) = GLOBAL_CURSOR.consume_for_vsync() {
             if let Some(top_key) = z_ordered_keys.iter().rev().find(|&&k| {
                 managed_windows

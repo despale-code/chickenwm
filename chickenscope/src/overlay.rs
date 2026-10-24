@@ -8,7 +8,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_WIN, VK_G, VK_TAB,
+    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_G,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetSystemMetrics, GetWindowLongW, RegisterClassW,
@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
-pub const HOTKEY_ID_OVERLAY_TOGGLE: i32 = 0x7E01; // Super + Tab
+pub const HOTKEY_ID_OVERLAY_TOGGLE: i32 = 0x7E01; // Super + Shift + G
 pub const HOTKEY_ID_GAMEMODE_TOGGLE: i32 = 0x7E02; // Super + G
 
 pub static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -37,15 +37,15 @@ unsafe extern "system" fn hud_overlay_wnd_proc(
 pub struct GameOverlay;
 
 impl GameOverlay {
-    /// Phase 7.1: Registers `Super + Tab` (HUD overlay toggle) and `Super + G` (manual Game Mode toggle)
+    /// Phase 7.1: Registers `Super + Shift + G` (HUD overlay toggle) and `Super + G` (manual Game Mode toggle)
     /// and initializes the hidden topmost overlay window.
     pub fn init() -> Result<()> {
         unsafe {
             let _ = RegisterHotKey(
                 None,
                 HOTKEY_ID_OVERLAY_TOGGLE,
-                MOD_WIN | MOD_NOREPEAT,
-                VK_TAB.0 as u32,
+                MOD_WIN | MOD_SHIFT | MOD_NOREPEAT,
+                VK_G.0 as u32,
             );
             let _ = RegisterHotKey(
                 None,
