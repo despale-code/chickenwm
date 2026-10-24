@@ -175,6 +175,7 @@ async fn main() -> Result<()> {
         monitor_origins.push((mon.rect.left, mon.rect.top));
         if let Some(ref ctx) = vk_ctx {
             if let Ok(sc) = MonitorSwapchain::new_with_vulkan(ctx, mon) {
+                let _ = pipeline.init_border_pipeline(&ctx.device, sc.render_pass);
                 let _ = register_high_polling_mouse(sc.hwnd);
                 canvas_hwnds.push(sc.hwnd);
                 swapchains.push(sc);
@@ -479,8 +480,11 @@ async fn main() -> Result<()> {
                             );
                         } else {
                             let shell_hwnd = unsafe { GetShellWindow() };
-                            let unfocused_colors = MacBorderColors::for_state(theme_mode, false);
-                            let focused_colors = MacBorderColors::for_state(theme_mode, true);
+                            let unfocused_colors = MacBorderColors::for_state(theme_mode, false)
+                                .with_corner_mask(clear_rgba);
+                            let focused_colors = MacBorderColors::for_state(theme_mode, true)
+                                .with_corner_mask(clear_rgba);
+                            let popup_colors = MacBorderColors::for_state(theme_mode, true);
 
                             // macOS Shadowless Dual-Rim: unfocused border on inactive visible windows
                             for key in &z_ordered_keys {
@@ -531,7 +535,7 @@ async fn main() -> Result<()> {
                                             mon_y,
                                             mon_w,
                                             mon_h,
-                                            focused_colors,
+                                            popup_colors,
                                             corner_radius.min(8),
                                         );
                                     }
@@ -583,6 +587,9 @@ async fn main() -> Result<()> {
             unsafe {
                 sc.destroy(ctx);
             }
+        }
+        unsafe {
+            pipeline.destroy(&ctx.device);
         }
     }
     Ok(())
