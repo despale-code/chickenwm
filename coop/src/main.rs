@@ -194,9 +194,12 @@ fn heal_native_window_frame(hwnd: HWND, role: WindowRole) {
         let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
 
         if matches!(role, WindowRole::Roobar | WindowRole::TransparentOverlay) {
-            // Ensure frameless transparent windows never have WS_CAPTION | WS_THICKFRAME or full-window DWM backdrop
-            if (cur & frame) != 0 {
-                let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur & !frame) as i32);
+            // Never strip WS_CAPTION from non-WS_POPUP windows (doing so while WS_SYSMENU is set
+            // causes user32 DefWindowProcW to paint a fallback classic Win95 caption on click/WM_NCACTIVATE).
+            // If WS_CAPTION was previously stripped on a non-popup window, restore it so winit/subclass
+            // WM_NCCALCSIZE + DWM handles it cleanly.
+            if (cur & WS_POPUP.0) == 0 && (cur & WS_CAPTION.0) == 0 {
+                let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur | WS_CAPTION.0) as i32);
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -231,8 +234,8 @@ fn heal_native_window_frame(hwnd: HWND, role: WindowRole) {
             return;
         }
 
-        // Only restore WS_CAPTION | WS_THICKFRAME on standard overlapped windows that have WS_SYSMENU
-        if (cur & WS_SYSMENU.0) != 0 && (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
+        // Restore WS_CAPTION | WS_THICKFRAME on standard non-popup windows so DWM never falls back to Win95 titlebars
+        if (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
             let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur | frame) as i32);
             let _ = SetWindowPos(
                 hwnd,
@@ -470,8 +473,8 @@ async fn main() -> Result<()> {
                                 let vk_tex = vk_ctx.as_ref().and_then(|ctx| {
                                     match ctx.import_dxgi_texture(
                                         cap.shared_handle,
-                                        cap.width,
-                                        cap.height,
+                                        cap.capacity_w,
+                                        cap.capacity_h,
                                     ) {
                                         Ok(t) => Some(t),
                                         Err(e) => {
@@ -556,30 +559,32 @@ async fn main() -> Result<()> {
             GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
         };
 
-        if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
-            if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
-                let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
-                let target_size = Vec2::new(
-                    (rc.right - rc.left).max(1) as f32,
-                    (rc.bottom - rc.top).max(1) as f32,
-                );
-                fg_entry.quad.physics.target = target_pos;
-                fg_entry.quad.size_physics.target = target_size;
-
-                if lbutton_down {
-                    // Real-time drag: snap directly to target with zero lag/oscillation
-                    fg_entry.quad.physics.position = target_pos;
-                    fg_entry.quad.physics.velocity = Vec2::default();
-                    fg_entry.quad.size_physics.position = target_size;
-                    fg_entry.quad.size_physics.velocity = Vec2::default();
-                    fg_entry.quad.width = target_size.x;
-                    fg_entry.quad.height = target_size.y;
+        if !lbutton_down {
+            if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
+                if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
+                    fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
+                    fg_entry.quad.size_physics.target = Vec2::new(
+                        (rc.right - rc.left).max(1) as f32,
+                        (rc.bottom - rc.top).max(1) as f32,
+                    );
                 }
             }
         }
 
         wallpaper.tick(dt);
         for entry in managed_windows.values_mut() {
+            if lbutton_down && entry.role != WindowRole::Desktop {
+                if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
+                    let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
+                    let target_size = Vec2::new(
+                        (rc.right - rc.left).max(1) as f32,
+                        (rc.bottom - rc.top).max(1) as f32,
+                    );
+                    entry.quad.physics.target = target_pos;
+                    entry.quad.size_physics.target = target_size;
+                }
+            }
+
             if let Some(ref cdev) = capture_dev {
                 let _ = entry.capture.poll_next_frame(cdev);
                 if entry.capture.handle_recreated {
@@ -599,8 +604,8 @@ async fn main() -> Result<()> {
                         entry.vk_tex = ctx
                             .import_dxgi_texture(
                                 entry.capture.shared_handle,
-                                entry.capture.width,
-                                entry.capture.height,
+                                entry.capture.capacity_w,
+                                entry.capture.capacity_h,
                             )
                             .ok();
                         entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
@@ -610,10 +615,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if (lbutton_down && entry.quad.hwnd == fg_hwnd)
+            if lbutton_down
                 || matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay | WindowRole::Desktop)
             {
-                // Keep locked to target position during real-time mouse drag or for roobar/overlays
+                // Keep locked to target position during real-time mouse drag/resize or for roobar/overlays
                 entry.quad.physics.position = entry.quad.physics.target;
                 entry.quad.physics.velocity = Vec2::default();
                 entry.quad.size_physics.position = entry.quad.size_physics.target;
@@ -702,6 +707,18 @@ async fn main() -> Result<()> {
                                         matches!(entry.role, WindowRole::Tiled | WindowRole::Desktop);
 
                                     if let Some(ds) = entry.descriptor_set {
+                                        let uv_scale = if let Some(ref tex) = entry.vk_tex {
+                                            [
+                                                (entry.capture.width as f32
+                                                    / tex.width.max(1) as f32)
+                                                    .clamp(0.0, 1.0),
+                                                (entry.capture.height as f32
+                                                    / tex.height.max(1) as f32)
+                                                    .clamp(0.0, 1.0),
+                                            ]
+                                        } else {
+                                            [1.0, 1.0]
+                                        };
                                         pipeline.record_textured_quad(
                                             device,
                                             cmd_buf,
@@ -713,6 +730,7 @@ async fn main() -> Result<()> {
                                             mon_h,
                                             quad_radius,
                                             force_opaque,
+                                            uv_scale,
                                         );
                                     }
 

@@ -76,12 +76,15 @@ pub struct WindowQuadPushConstants {
     pub rect: [f32; 4],
     /// `(screen_width, screen_height, corner_radius, force_opaque_rgb)`.
     pub screen_and_radius: [f32; 4],
+    /// `(u_scale, v_scale, 0.0, 0.0)` mapping `[0, 1]` quad UV to active sub-region of the padded capture texture.
+    pub uv_scale: [f32; 4],
 }
 
 const QUAD_SHADER_WGSL: &str = r#"
 struct WindowQuadPushConstants {
     rect: vec4<f32>,
     screen_and_radius: vec4<f32>,
+    uv_scale: vec4<f32>,
 };
 
 var<push_constant> pc: WindowQuadPushConstants;
@@ -116,7 +119,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
 
     var out: VertexOutput;
     out.position = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
-    out.uv = uv;
+    out.uv = uv * pc.uv_scale.xy;
     out.local_p = pixel_pos - center;
     return out;
 }
@@ -603,6 +606,7 @@ impl CompositorPipeline {
         mon_h: u32,
         radius: i32,
         force_opaque: bool,
+        uv_scale: [f32; 2],
     ) {
         if self.quad_pipeline == vk::Pipeline::null()
             || self.quad_layout == vk::PipelineLayout::null()
@@ -627,6 +631,7 @@ impl CompositorPipeline {
                 r as f32,
                 if force_opaque { 1.0 } else { 0.0 },
             ],
+            uv_scale: [uv_scale[0], uv_scale[1], 0.0, 0.0],
         };
 
         unsafe {

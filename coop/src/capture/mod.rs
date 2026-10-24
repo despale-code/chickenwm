@@ -132,6 +132,8 @@ pub struct WindowCaptureSession {
     pub session: Option<GraphicsCaptureSession>,
     pub width: u32,
     pub height: u32,
+    pub capacity_w: u32,
+    pub capacity_h: u32,
     pub paused: bool,
     pub has_frame: bool,
     pub handle_recreated: bool,
@@ -160,16 +162,18 @@ impl WindowCaptureSession {
         });
         let w = item_size.Width.max(1) as u32;
         let h = item_size.Height.max(1) as u32;
+        let cap_w = ((w + 511) & !511).max(2560);
+        let cap_h = ((h + 511) & !511).max(1440);
 
-        let (shared_tex, shared_handle) = dev.create_shared_texture(w, h)?;
+        let (shared_tex, shared_handle) = dev.create_shared_texture(cap_w, cap_h)?;
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &dev.winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
             3,
             SizeInt32 {
-                Width: w as i32,
-                Height: h as i32,
+                Width: cap_w as i32,
+                Height: cap_h as i32,
             },
         )
         .context("Direct3D11CaptureFramePool::CreateFreeThreaded failed")?;
@@ -190,6 +194,8 @@ impl WindowCaptureSession {
             session: Some(session),
             width: w,
             height: h,
+            capacity_w: cap_w,
+            capacity_h: cap_h,
             paused: false,
             has_frame: false,
             handle_recreated: false,
@@ -219,9 +225,13 @@ impl WindowCaptureSession {
         let new_w = content_size.Width.max(1) as u32;
         let new_h = content_size.Height.max(1) as u32;
 
-        if new_w != self.width || new_h != self.height {
-            self.resize_pool(dev, new_w, new_h)?;
+        if new_w > self.capacity_w || new_h > self.capacity_h {
+            let new_cap_w = ((new_w + 511) & !511).max(self.capacity_w);
+            let new_cap_h = ((new_h + 511) & !511).max(self.capacity_h);
+            self.resize_pool(dev, new_cap_w, new_cap_h)?;
         }
+        self.width = new_w;
+        self.height = new_h;
 
         let surface = frame.Surface()?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
@@ -231,8 +241,8 @@ impl WindowCaptureSession {
             src_tex.GetDesc(&mut src_desc);
 
             if let Some(dst_tex) = &self.shared_texture {
-                let copy_w = self.width.min(src_desc.Width).max(1);
-                let copy_h = self.height.min(src_desc.Height).max(1);
+                let copy_w = self.width.min(src_desc.Width).min(self.capacity_w).max(1);
+                let copy_h = self.height.min(src_desc.Height).min(self.capacity_h).max(1);
                 let src_box = D3D11_BOX {
                     left: 0,
                     top: 0,
@@ -261,7 +271,7 @@ impl WindowCaptureSession {
         Ok(true)
     }
 
-    /// Dynamically resizes the frame pool and shared NT texture during live interactive resize (Phase 3.4).
+    /// Dynamically expands the frame pool and shared NT texture when a window grows beyond pre-allocated capacity.
     pub fn resize_pool(&mut self, dev: &CaptureDevice, new_w: u32, new_h: u32) -> Result<()> {
         let w = new_w.max(1);
         let h = new_h.max(1);
@@ -284,8 +294,8 @@ impl WindowCaptureSession {
         let (tex, handle) = dev.create_shared_texture(w, h)?;
         self.shared_texture = Some(tex);
         self.shared_handle = handle;
-        self.width = w;
-        self.height = h;
+        self.capacity_w = w;
+        self.capacity_h = h;
         self.handle_recreated = true;
         Ok(())
     }
