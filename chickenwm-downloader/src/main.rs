@@ -357,7 +357,7 @@ impl DownloaderApp {
     fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         egui::Frame::NONE
             .fill(pal.sidebar)
-            .stroke(Stroke::new(1.0, pal.border))
+            .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -421,7 +421,7 @@ impl DownloaderApp {
                                 .color(if active { pal.accent_fg } else { pal.fg }),
                         )
                         .fill(if active { pal.accent } else { pal.card })
-                        .stroke(Stroke::new(1.0, pal.border))
+                        .stroke(Stroke::new(1.0_f32, pal.border))
                         .corner_radius(CornerRadius::same(6));
                         if ui.add(btn).clicked() {
                             self.engine.set_global_speed_limit(kbps);
@@ -518,7 +518,7 @@ impl DownloaderApp {
     fn draw_single_item_card(&mut self, ui: &mut egui::Ui, item: &DownloadItem, pal: &Palette) {
         egui::Frame::NONE
             .fill(pal.card)
-            .stroke(Stroke::new(1.0, pal.border))
+            .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| {
@@ -686,7 +686,7 @@ impl DownloaderApp {
                             .color(pal.danger),
                     )
                     .fill(pal.sidebar)
-                    .stroke(Stroke::new(1.0, pal.border))
+                    .stroke(Stroke::new(1.0_f32, pal.border))
                     .corner_radius(CornerRadius::same(6));
                     if ui.add(del_btn).clicked() {
                         let shift = ui.input(|i| i.modifiers.shift);
@@ -742,7 +742,7 @@ impl DownloaderApp {
             .frame(
                 egui::Frame::NONE
                     .fill(pal.card)
-                    .stroke(Stroke::new(1.5, pal.accent))
+                    .stroke(Stroke::new(1.5_f32, pal.accent))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(18, 16)),
             )
@@ -973,7 +973,7 @@ fn tab_pill(ui: &mut egui::Ui, label: &str, active: bool, pal: &Palette) -> egui
             .color(if active { pal.accent_fg } else { pal.fg }),
     )
     .fill(if active { pal.accent } else { pal.card })
-    .stroke(Stroke::new(1.0, pal.border))
+    .stroke(Stroke::new(1.0_f32, pal.border))
     .corner_radius(CornerRadius::same(8));
     ui.add(btn)
 }
@@ -981,7 +981,7 @@ fn tab_pill(ui: &mut egui::Ui, label: &str, active: bool, pal: &Palette) -> egui
 fn small_action_btn(ui: &mut egui::Ui, label: &str, pal: &Palette) -> egui::Response {
     let btn = egui::Button::new(RichText::new(label).size(12.0).color(pal.fg))
         .fill(pal.card)
-        .stroke(Stroke::new(1.0, pal.border))
+        .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(CornerRadius::same(6));
     ui.add(btn)
 }
@@ -989,7 +989,7 @@ fn small_action_btn(ui: &mut egui::Ui, label: &str, pal: &Palette) -> egui::Resp
 fn status_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::NONE
         .fill(color.gamma_multiply(0.18))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.6)))
         .corner_radius(CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(7, 2))
         .show(ui, |ui| {
@@ -1018,11 +1018,11 @@ fn draw_panel_close_button(ctx: &egui::Context, screen: Rect, pal: &Palette) -> 
             };
             ui.painter().line_segment(
                 [cc + Vec2::new(-4.5, -4.5), cc + Vec2::new(4.5, 4.5)],
-                Stroke::new(1.4, col),
+                Stroke::new(1.4_f32, col),
             );
             ui.painter().line_segment(
                 [cc + Vec2::new(4.5, -4.5), cc + Vec2::new(-4.5, 4.5)],
-                Stroke::new(1.4, col),
+                Stroke::new(1.4_f32, col),
             );
             if close_resp.on_hover_text("Hide download manager (Esc)").clicked() {
                 close_clicked = true;
