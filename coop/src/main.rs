@@ -28,14 +28,16 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::Controls::MARGINS;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetPropW, GetShellWindow,
     GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, IsIconic, IsWindowVisible,
-    PeekMessageW, SetWindowLongW, SetWindowPos, TranslateMessage, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
-    MSG, PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_SYSMENU, WS_THICKFRAME,
+    PeekMessageW, SetForegroundWindow, SetWindowLongW, SetWindowPos, TranslateMessage, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, MSG, PM_REMOVE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,7 +389,8 @@ async fn main() -> Result<()> {
     let mut last_cfg_check = Instant::now();
 
     let mut wallpaper = WallpaperLayer::new();
-    let _expose = ExposeOverview::new();
+    let mut expose = ExposeOverview::new();
+    let mut expose_chord_held = false;
     let mut managed_windows: HashMap<isize, ManagedWindow> = HashMap::new();
     let mut failed_hwnds: HashSet<isize> = HashSet::new();
     let mut z_ordered_keys: Vec<isize> = Vec::new();
@@ -452,8 +455,12 @@ async fn main() -> Result<()> {
                 let role = classify_window_role(hwnd);
 
                 if let Some(entry) = managed_windows.get_mut(&key) {
-                    entry.quad.physics.target = Vec2::new(x, y);
-                    entry.quad.size_physics.target = Vec2::new(w, h);
+                    if !expose.active
+                        || !matches!(role, WindowRole::Tiled | WindowRole::Floating)
+                    {
+                        entry.quad.physics.target = Vec2::new(x, y);
+                        entry.quad.size_physics.target = Vec2::new(w, h);
+                    }
                     entry.quad.z_order = z_idx as i32;
                     entry.role = role;
                 } else if !failed_hwnds.contains(&key) {
@@ -544,13 +551,69 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Phase 3.5: Toggle Exposé bird's-eye overview on Ctrl + Alt + Tab
+        let ctrl_alt_tab = unsafe {
+            GetAsyncKeyState(VK_CONTROL.0 as i32) < 0
+                && GetAsyncKeyState(VK_MENU.0 as i32) < 0
+                && GetAsyncKeyState(VK_TAB.0 as i32) < 0
+        };
+        if ctrl_alt_tab && !expose_chord_held {
+            expose.toggle();
+            if !expose.active {
+                last_enum = now - Duration::from_secs(1);
+            }
+            tracing::info!("Exposé overview toggled: active={}", expose.active);
+        }
+        expose_chord_held = ctrl_alt_tab;
+
         // Poll latest WGC frames and step spring-damper physics for all tracked windows
         let fg_hwnd = unsafe { GetForegroundWindow() };
         let lbutton_down = unsafe {
             GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
         };
 
-        if !lbutton_down {
+        if expose.active {
+            let expose_keys: Vec<isize> = z_ordered_keys
+                .iter()
+                .copied()
+                .filter(|k| {
+                    managed_windows
+                        .get(k)
+                        .is_some_and(|e| matches!(e.role, WindowRole::Tiled | WindowRole::Floating))
+                })
+                .collect();
+            let total = expose_keys.len();
+            let (mon_x, mon_y) = monitor_origins.first().copied().unwrap_or((0, 0));
+            let (mon_w, mon_h) = swapchains
+                .first()
+                .map(|s| (s.width as f32, s.height as f32))
+                .unwrap_or((1920.0, 1080.0));
+
+            for (slot_idx, key) in expose_keys.iter().enumerate() {
+                if let Some(entry) = managed_windows.get_mut(key) {
+                    let (sx, sy, sw, sh) = expose.compute_slot(slot_idx, total, mon_w, mon_h);
+                    entry.quad.physics.target = Vec2::new(mon_x as f32 + sx, mon_y as f32 + sy);
+                    entry.quad.size_physics.target = Vec2::new(sw, sh);
+                }
+            }
+
+            if lbutton_down {
+                let (cx, cy) = GLOBAL_CURSOR.get();
+                if let Some(&clicked_key) = expose_keys.iter().rev().find(|&&k| {
+                    managed_windows
+                        .get(&k)
+                        .is_some_and(|e| e.quad.hit_test(cx as f32, cy as f32))
+                }) {
+                    if let Some(entry) = managed_windows.get(&clicked_key) {
+                        unsafe {
+                            let _ = SetForegroundWindow(entry.quad.hwnd);
+                        }
+                    }
+                    expose.active = false;
+                    last_enum = now - Duration::from_secs(1);
+                }
+            }
+        } else if !lbutton_down {
             if let Some(fg_entry) = managed_windows.get_mut(&(fg_hwnd.0 as isize)) {
                 if let Some(rc) = get_window_extended_bounds(fg_hwnd) {
                     fg_entry.quad.physics.target = Vec2::new(rc.left as f32, rc.top as f32);
@@ -564,7 +627,7 @@ async fn main() -> Result<()> {
 
         wallpaper.tick(dt);
         for entry in managed_windows.values_mut() {
-            if lbutton_down && entry.role != WindowRole::Desktop {
+            if !expose.active && lbutton_down && entry.role != WindowRole::Desktop {
                 if let Some(rc) = get_window_extended_bounds(entry.quad.hwnd) {
                     let target_pos = Vec2::new(rc.left as f32, rc.top as f32);
                     let target_size = Vec2::new(
@@ -606,7 +669,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if lbutton_down
+            if (lbutton_down && !expose.active)
                 || matches!(entry.role, WindowRole::Roobar | WindowRole::TransparentOverlay | WindowRole::Desktop)
             {
                 // Keep locked to target position during real-time mouse drag/resize or for roobar/overlays
