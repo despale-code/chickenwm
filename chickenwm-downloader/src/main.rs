@@ -62,9 +62,19 @@ struct Cli {
     #[arg(long)]
     prompt_location: bool,
 
+    /// Toggle or open the downloader flyout panel.
+    #[arg(long)]
+    toggle: bool,
+
     /// Render a single frame headless to the given PNG path and exit.
     #[arg(long)]
     render_to: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum IncomingCmd {
+    Add(PendingAddRequest),
+    TogglePanel,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +84,9 @@ struct PendingAddRequest {
     save_dir: String,
     is_torrent: bool,
     prompt_location: bool,
+    cookies: Option<String>,
+    referer: Option<String>,
+    user_agent: Option<String>,
 }
 
 struct Palette {
@@ -124,13 +137,21 @@ pub struct DownloaderApp {
     engine: Arc<DownloadEngine>,
     css: Arc<RwLock<CssStyleSheet>>,
     active_tab: DownloadKind,
-    incoming_queue: Arc<RwLock<VecDeque<PendingAddRequest>>>,
+    incoming_queue: Arc<RwLock<VecDeque<IncomingCmd>>>,
+    /// Whether the slide-out downloader center panel is currently open
+    panel_open: bool,
+    panel_since: std::time::Instant,
+    window_ready: bool,
+    last_geometry: Option<(Pos2, Vec2, bool)>,
     /// Modal dialog state for adding a new download / choosing save location
     modal_open: bool,
     modal_url: String,
     modal_filename: String,
     modal_save_dir: String,
     modal_is_torrent: bool,
+    modal_cookies: Option<String>,
+    modal_referer: Option<String>,
+    modal_user_agent: Option<String>,
     /// Inline folder editor for changing an existing item's save location
     editing_location_id: Option<u64>,
     editing_location_path: String,
@@ -143,7 +164,8 @@ impl DownloaderApp {
     fn new(
         engine: Arc<DownloadEngine>,
         css: Arc<RwLock<CssStyleSheet>>,
-        incoming_queue: Arc<RwLock<VecDeque<PendingAddRequest>>>,
+        incoming_queue: Arc<RwLock<VecDeque<IncomingCmd>>>,
+        start_open: bool,
     ) -> Self {
         let (default_dir, global_lim) = {
             let st = engine.state.read();
@@ -154,11 +176,18 @@ impl DownloaderApp {
             css,
             active_tab: DownloadKind::Http,
             incoming_queue,
+            panel_open: start_open,
+            panel_since: std::time::Instant::now(),
+            window_ready: false,
+            last_geometry: None,
             modal_open: false,
             modal_url: String::new(),
             modal_filename: String::new(),
             modal_save_dir: default_dir,
             modal_is_torrent: false,
+            modal_cookies: None,
+            modal_referer: None,
+            modal_user_agent: None,
             editing_location_id: None,
             editing_location_path: String::new(),
             custom_limit_input: if global_lim > 0 {
@@ -171,32 +200,52 @@ impl DownloaderApp {
     }
 
     fn process_incoming(&mut self, ctx: &egui::Context) {
-        while let Some(req) = self.incoming_queue.write().pop_front() {
-            let is_torrent = req.is_torrent || detect_is_torrent(&req.url, Some(&req.filename));
-            self.active_tab = if is_torrent {
-                DownloadKind::Torrent
-            } else {
-                DownloadKind::Http
-            };
+        while let Some(cmd) = self.incoming_queue.write().pop_front() {
+            match cmd {
+                IncomingCmd::TogglePanel => {
+                    self.panel_open = !self.panel_open;
+                    self.panel_since = std::time::Instant::now();
+                    if self.panel_open {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                }
+                IncomingCmd::Add(req) => {
+                    let is_torrent =
+                        req.is_torrent || detect_is_torrent(&req.url, Some(&req.filename));
+                    self.active_tab = if is_torrent {
+                        DownloadKind::Torrent
+                    } else {
+                        DownloadKind::Http
+                    };
+                    self.panel_open = true;
+                    self.panel_since = std::time::Instant::now();
 
-            let ask_location = self.engine.state.read().ask_save_location || req.prompt_location;
-            if ask_location {
-                self.modal_open = true;
-                self.modal_url = req.url;
-                self.modal_filename = req.filename;
-                self.modal_save_dir = req.save_dir;
-                self.modal_is_torrent = is_torrent;
-            } else {
-                self.engine.add_download(
-                    req.url,
-                    Some(req.filename),
-                    Some(req.save_dir),
-                    is_torrent,
-                    true,
-                );
+                    let ask_location =
+                        self.engine.state.read().ask_save_location || req.prompt_location;
+                    if ask_location {
+                        self.modal_open = true;
+                        self.modal_url = req.url;
+                        self.modal_filename = req.filename;
+                        self.modal_save_dir = req.save_dir;
+                        self.modal_is_torrent = is_torrent;
+                        self.modal_cookies = req.cookies;
+                        self.modal_referer = req.referer;
+                        self.modal_user_agent = req.user_agent;
+                    } else {
+                        self.engine.add_download_with_context(
+                            req.url,
+                            Some(req.filename),
+                            Some(req.save_dir),
+                            is_torrent,
+                            true,
+                            req.cookies,
+                            req.referer,
+                            req.user_agent,
+                        );
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -285,6 +334,9 @@ impl DownloaderApp {
                 self.modal_filename.clear();
                 self.modal_save_dir = self.engine.state.read().default_save_dir.clone();
                 self.modal_is_torrent = self.active_tab == DownloadKind::Torrent;
+                self.modal_cookies = None;
+                self.modal_referer = None;
+                self.modal_user_agent = None;
             }
 
             // Window controls on the right
@@ -768,12 +820,15 @@ impl DownloaderApp {
                         } else {
                             DownloadKind::Http
                         };
-                        self.engine.add_download(
+                        self.engine.add_download_with_context(
                             self.modal_url.trim().to_string(),
                             Some(sanitize_filename(&self.modal_filename)),
                             Some(self.modal_save_dir.trim().to_string()),
                             is_tor,
                             true,
+                            self.modal_cookies.take(),
+                            self.modal_referer.take(),
+                            self.modal_user_agent.take(),
                         );
                         self.modal_open = false;
                     }
@@ -788,12 +843,15 @@ impl DownloaderApp {
                         } else {
                             DownloadKind::Http
                         };
-                        self.engine.add_download(
+                        self.engine.add_download_with_context(
                             self.modal_url.trim().to_string(),
                             Some(sanitize_filename(&self.modal_filename)),
                             Some(self.modal_save_dir.trim().to_string()),
                             is_tor,
                             false,
+                            self.modal_cookies.take(),
+                            self.modal_referer.take(),
+                            self.modal_user_agent.take(),
                         );
                         self.modal_open = false;
                     }
@@ -811,8 +869,19 @@ impl eframe::App for DownloaderApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if !self.window_ready {
+            self.window_ready = prepare_service_window(frame);
+        }
         self.process_incoming(ctx);
+
+        if self.panel_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.modal_open {
+                self.modal_open = false;
+            } else {
+                self.panel_open = false;
+            }
+        }
 
         let any_active = self
             .engine
@@ -821,19 +890,57 @@ impl eframe::App for DownloaderApp {
             .items
             .iter()
             .any(|i| i.status.is_active());
-        if any_active {
+        if any_active && self.panel_open {
             ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
+        // Compute slide-out panel geometry (anchored below roobar at top-right of primary work area, like notifications)
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let work_px = primary_work_area();
+        let work = [
+            work_px[0] / ppp,
+            work_px[1] / ppp,
+            work_px[2] / ppp,
+            work_px[3] / ppp,
+        ];
+        let panel_w = 780.0_f32.min((work[2] - 24.0).max(480.0));
+        let panel_h = 560.0_f32.min((work[3] - 24.0).max(360.0));
+        let (pos, size, passthrough) = if self.panel_open {
+            let x = (work[0] + work[2] - panel_w - 12.0).round();
+            let y = (work[1] + 10.0).round();
+            (Pos2::new(x, y), Vec2::new(panel_w, panel_h), false)
+        } else {
+            (
+                Pos2::new((work[0] + work[2] - 2.0).round(), work[1].round()),
+                Vec2::new(1.0, 1.0),
+                true,
+            )
+        };
+        let geometry = (pos, size, passthrough);
+        if self.last_geometry != Some(geometry) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.0));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.1));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(geometry.2));
+            self.last_geometry = Some(geometry);
+        }
+
+        if !self.panel_open {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+            return;
         }
 
         let sheet = self.css.read().clone();
         let pal = Palette::from_css(&sheet);
         let screen = ctx.screen_rect();
-        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let is_max = false;
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(pal.bg)
+                    .corner_radius(CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(14, 10)),
             )
             .show(ctx, |ui| {
@@ -846,9 +953,9 @@ impl eframe::App for DownloaderApp {
 
         self.draw_add_modal(ctx, &pal);
 
-        // Window edge resize & top-right window controls
-        chickenwm_core::window_frame::handle_window_edge_resize(ctx, screen, is_max);
-        draw_window_controls(ctx, screen, &pal, is_max);
+        if draw_panel_close_button(ctx, screen, &pal) {
+            self.panel_open = false;
+        }
 
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -890,66 +997,77 @@ fn status_chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
-fn draw_window_controls(ctx: &egui::Context, screen: Rect, pal: &Palette, is_max: bool) {
-    let x = (screen.right() - 88.0).max(screen.left() + 4.0);
+fn draw_panel_close_button(ctx: &egui::Context, screen: Rect, pal: &Palette) -> bool {
+    let mut close_clicked = false;
+    let x = (screen.right() - 38.0).max(screen.left() + 4.0);
     egui::Area::new(egui::Id::new("downloader_win_controls"))
         .order(egui::Order::Foreground)
         .fixed_pos(Pos2::new(x, screen.top() + 10.0))
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-
-                let (min_r, min_resp) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
-                if min_resp.hovered() {
-                    ui.painter().rect_filled(min_r, CornerRadius::same(4), pal.fg.gamma_multiply(0.1));
-                }
-                let mc = min_r.center();
-                ui.painter().line_segment(
-                    [mc + Vec2::new(-4.5, 0.0), mc + Vec2::new(4.5, 0.0)],
-                    Stroke::new(1.4, pal.fg),
-                );
-                if min_resp.clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                }
-
-                let (max_r, max_resp) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
-                if max_resp.hovered() {
-                    ui.painter().rect_filled(max_r, CornerRadius::same(4), pal.fg.gamma_multiply(0.1));
-                }
-                ui.painter().rect_stroke(
-                    Rect::from_center_size(max_r.center(), Vec2::splat(9.0)),
-                    CornerRadius::same(2),
-                    Stroke::new(1.2, pal.fg),
-                    egui::StrokeKind::Inside,
-                );
-                if max_resp.clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
-                }
-
-                let (close_r, close_resp) =
-                    ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
-                if close_resp.hovered() {
-                    ui.painter().rect_filled(close_r, CornerRadius::same(4), pal.danger);
-                }
-                let cc = close_r.center();
-                let col = if close_resp.hovered() {
-                    Color32::WHITE
-                } else {
-                    pal.fg
-                };
-                ui.painter().line_segment(
-                    [cc + Vec2::new(-4.5, -4.5), cc + Vec2::new(4.5, 4.5)],
-                    Stroke::new(1.4, col),
-                );
-                ui.painter().line_segment(
-                    [cc + Vec2::new(4.5, -4.5), cc + Vec2::new(-4.5, 4.5)],
-                    Stroke::new(1.4, col),
-                );
-                if close_resp.clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
+            let (close_r, close_resp) =
+                ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
+            if close_resp.hovered() {
+                ui.painter()
+                    .rect_filled(close_r, CornerRadius::same(4), pal.danger);
+            }
+            let cc = close_r.center();
+            let col = if close_resp.hovered() {
+                Color32::WHITE
+            } else {
+                pal.fg
+            };
+            ui.painter().line_segment(
+                [cc + Vec2::new(-4.5, -4.5), cc + Vec2::new(4.5, 4.5)],
+                Stroke::new(1.4, col),
+            );
+            ui.painter().line_segment(
+                [cc + Vec2::new(4.5, -4.5), cc + Vec2::new(-4.5, 4.5)],
+                Stroke::new(1.4, col),
+            );
+            if close_resp.on_hover_text("Hide download manager (Esc)").clicked() {
+                close_clicked = true;
+            }
         });
+    close_clicked
+}
+
+fn primary_work_area() -> [f32; 4] {
+    for m in chickenwm_core::monitor::enumerate_monitors() {
+        if m.is_primary {
+            let [x, y, w, h] = m.work_rect;
+            return [x as f32, y as f32, w as f32, h as f32];
+        }
+    }
+    [0.0, 0.0, 1920.0, 1080.0]
+}
+
+fn prepare_service_window(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::{BOOL, HWND};
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    };
+    let Ok(handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = HWND(h.hwnd.get() as _);
+    chickenwm_core::sys::suppress_nc_paint(hwnd);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_TOOLWINDOW.0 as isize));
+        let off = BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &off as *const _ as *const core::ffi::c_void,
+            4,
+        );
+    }
+    true
 }
 
 fn open_path_in_files(dir: &str) {
@@ -1021,7 +1139,7 @@ fn main() -> Result<()> {
 
     let state_path = config_dir().join("downloader.json");
     let engine = DownloadEngine::load_or_new(state_path);
-    let incoming_queue: Arc<RwLock<VecDeque<PendingAddRequest>>> =
+    let incoming_queue: Arc<RwLock<VecDeque<IncomingCmd>>> =
         Arc::new(RwLock::new(VecDeque::new()));
 
     // If `--add-url` was passed on CLI and another instance is already running, forward via IPC
@@ -1033,13 +1151,16 @@ fn main() -> Result<()> {
             save_dir: cli.save_dir.clone(),
             is_torrent: is_tor,
             prompt_location: cli.prompt_location,
+            cookies: None,
+            referer: None,
+            user_agent: None,
         };
         if send_ipc_command_blocking(PIPE_NAME_DOWNLOADER, &cmd).is_ok() {
             return Ok(());
         }
         // Otherwise queue it for this newly launched instance
         let def_dir = engine.state.read().default_save_dir.clone();
-        incoming_queue.write().push_back(PendingAddRequest {
+        incoming_queue.write().push_back(IncomingCmd::Add(PendingAddRequest {
             url: url.clone(),
             filename: cli
                 .filename
@@ -1048,7 +1169,31 @@ fn main() -> Result<()> {
             save_dir: cli.save_dir.clone().unwrap_or(def_dir),
             is_torrent: is_tor,
             prompt_location: cli.prompt_location,
-        });
+            cookies: None,
+            referer: None,
+            user_agent: None,
+        }));
+    } else if cli.render_to.is_none() {
+        // Check if the background service is already running; if so, toggle the panel and exit
+        if cli.toggle {
+            if send_ipc_command_blocking(PIPE_NAME_DOWNLOADER, &IpcCommand::ToggleDownloaderCenter)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        } else if send_ipc_command_blocking(
+            PIPE_NAME_DOWNLOADER,
+            &IpcCommand::QueryDownloaderStatus,
+        )
+        .is_ok()
+        {
+            // Another instance is already running as the background service; toggle its panel
+            let _ = send_ipc_command_blocking(
+                PIPE_NAME_DOWNLOADER,
+                &IpcCommand::ToggleDownloaderCenter,
+            );
+            return Ok(());
+        }
     }
 
     let (_doc, _cfg) = bootstrap_config_and_themes()?;
@@ -1074,14 +1219,15 @@ fn main() -> Result<()> {
 
     if let Some(req) = chickenwm_core::headless::RenderRequest::from_args([920.0, 620.0]) {
         return chickenwm_core::headless::render_app(&req, |_cc| {
-            DownloaderApp::new(engine, css, incoming_queue)
+            DownloaderApp::new(engine, css, incoming_queue, true)
         });
     }
 
     // Spawn IPC server on `\\.\pipe\chickenwm-downloader-ipc`
     let q_ipc = Arc::clone(&incoming_queue);
     let eng_ipc = Arc::clone(&engine);
-    let egui_ctx_slot: Arc< std::sync::OnceLock<egui::Context> > = Arc::new(std::sync::OnceLock::new());
+    let egui_ctx_slot: Arc<std::sync::OnceLock<egui::Context>> =
+        Arc::new(std::sync::OnceLock::new());
     let ctx_ipc = Arc::clone(&egui_ctx_slot);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1098,23 +1244,61 @@ fn main() -> Result<()> {
                             save_dir,
                             is_torrent,
                             prompt_location,
+                            cookies,
+                            referer,
+                            user_agent,
                         } => {
                             let is_tor =
                                 is_torrent || detect_is_torrent(&url, filename.as_deref());
                             let def_dir = eng.state.read().default_save_dir.clone();
-                            q.write().push_back(PendingAddRequest {
+                            q.write().push_back(IncomingCmd::Add(PendingAddRequest {
                                 filename: filename
                                     .unwrap_or_else(|| infer_filename_from_url(&url, is_tor)),
                                 save_dir: save_dir.unwrap_or(def_dir),
                                 url,
                                 is_torrent: is_tor,
                                 prompt_location,
-                            });
+                                cookies,
+                                referer,
+                                user_agent,
+                            }));
                             if let Some(ctx) = ctx_slot.get() {
                                 ctx.request_repaint();
                             }
                             IpcResponse::Ok {
                                 message: "Download queued in ChickenWM Downloader".to_string(),
+                            }
+                        }
+                        IpcCommand::ToggleDownloaderCenter => {
+                            q.write().push_back(IncomingCmd::TogglePanel);
+                            if let Some(ctx) = ctx_slot.get() {
+                                ctx.request_repaint();
+                            }
+                            IpcResponse::Ok {
+                                message: "ok".to_string(),
+                            }
+                        }
+                        IpcCommand::QueryDownloaderStatus => {
+                            let st = eng.state.read();
+                            let total_count = st.items.len() as u32;
+                            let active_items: Vec<&DownloadItem> =
+                                st.items.iter().filter(|i| i.status.is_active()).collect();
+                            let active_count = active_items.len() as u32;
+                            let speed_bps: u64 = active_items.iter().map(|i| i.speed_bps).sum();
+                            let progress_pct = if active_items.is_empty() {
+                                0
+                            } else {
+                                let sum_frac: f32 =
+                                    active_items.iter().map(|i| i.progress_fraction()).sum();
+                                ((sum_frac / active_items.len() as f32) * 100.0)
+                                    .round()
+                                    .clamp(0.0, 100.0) as u8
+                            };
+                            IpcResponse::DownloaderStatus {
+                                active_count,
+                                total_count,
+                                speed_bps,
+                                progress_pct,
                             }
                         }
                         _ => IpcResponse::Ok {
@@ -1127,6 +1311,7 @@ fn main() -> Result<()> {
         });
     });
 
+    let start_open = cli.toggle || cli.add_url.is_some();
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
@@ -1134,8 +1319,11 @@ fn main() -> Result<()> {
             .with_title("ChickenWM Downloader")
             .with_decorations(false)
             .with_transparent(true)
-            .with_inner_size([920.0, 620.0])
-            .with_min_inner_size([480.0, 320.0]),
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_inner_size([1.0, 1.0])
+            .with_position([0.0, 0.0])
+            .with_mouse_passthrough(true),
         ..Default::default()
     };
 
@@ -1144,24 +1332,12 @@ fn main() -> Result<()> {
         native_options,
         Box::new(move |cc| {
             let _ = egui_ctx_slot.set(cc.egui_ctx.clone());
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(handle) = cc.window_handle() {
-                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
-                    chickenwm_core::sys::apply_acrylic(hwnd, None);
-                    let corner = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
-                    let _ = unsafe {
-                        windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-                            hwnd,
-                            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
-                            &corner as *const _ as *const _,
-                            std::mem::size_of_val(&corner) as u32,
-                        )
-                    };
-                    chickenwm_core::sys::enable_borderless_resizing(hwnd);
-                }
-            }
-            Ok(Box::new(DownloaderApp::new(engine, css, incoming_queue)))
+            Ok(Box::new(DownloaderApp::new(
+                engine,
+                css,
+                incoming_queue,
+                start_open,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
@@ -1202,7 +1378,7 @@ mod tests {
         };
         let css = Arc::new(RwLock::new(CssStyleSheet::default()));
         let q = Arc::new(RwLock::new(VecDeque::new()));
-        chickenwm_core::headless::render_app(&req, |_cc| DownloaderApp::new(engine, css, q))
+        chickenwm_core::headless::render_app(&req, |_cc| DownloaderApp::new(engine, css, q, true))
             .expect("headless render of chickenwm-downloader should succeed");
         let meta = std::fs::metadata(&out_path).expect("screenshot written");
         assert!(meta.len() > 1000);

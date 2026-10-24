@@ -200,6 +200,7 @@ fn classify_window_role(hwnd: HWND) -> WindowRole {
             || title == "ChickenWM Power"
             || title == "ChickenWM Launcher"
             || title == "ChickenWM Notifications"
+            || title == "ChickenWM Downloader"
             || class == "#32768"
         {
             return WindowRole::TransparentOverlay;

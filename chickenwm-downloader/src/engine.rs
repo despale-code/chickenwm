@@ -63,6 +63,15 @@ pub struct DownloadItem {
     #[serde(default)]
     pub speed_limit_kbps: u32,
     pub added_at: u64,
+    /// Optional HTTP Cookie header forwarded from browser (`name=value; ...`).
+    #[serde(default)]
+    pub cookies: Option<String>,
+    /// Optional HTTP Referer URL forwarded from browser.
+    #[serde(default)]
+    pub referer: Option<String>,
+    /// Optional HTTP User-Agent forwarded from browser.
+    #[serde(default)]
+    pub user_agent: Option<String>,
     /// Torrent-specific metadata
     #[serde(default)]
     pub info_hash_hex: String,
@@ -216,7 +225,37 @@ impl DownloadEngine {
         is_torrent_hint: bool,
         start_immediately: bool,
     ) -> u64 {
-        let is_torrent = is_torrent_hint || detect_is_torrent(&url, filename.as_deref());
+        self.add_download_with_context(
+            url,
+            filename,
+            save_dir,
+            is_torrent_hint,
+            start_immediately,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_download_with_context(
+        self: &Arc<Self>,
+        url: String,
+        filename: Option<String>,
+        save_dir: Option<String>,
+        is_torrent_hint: bool,
+        start_immediately: bool,
+        cookies: Option<String>,
+        referer: Option<String>,
+        user_agent: Option<String>,
+    ) -> u64 {
+        let normalized_url = if is_torrent_hint || detect_is_torrent(&url, filename.as_deref()) {
+            url.trim().to_string()
+        } else {
+            normalize_download_url(&url)
+        };
+        let is_torrent =
+            is_torrent_hint || detect_is_torrent(&normalized_url, filename.as_deref());
         let kind = if is_torrent {
             DownloadKind::Torrent
         } else {
@@ -225,8 +264,8 @@ impl DownloadEngine {
 
         let resolved_filename = filename
             .map(|f| sanitize_filename(&f))
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| infer_filename_from_url(&url, is_torrent));
+            .filter(|f| !f.is_empty() && !is_generic_placeholder_filename(&f))
+            .unwrap_or_else(|| infer_filename_from_url(&normalized_url, is_torrent));
 
         let id = {
             let mut st = self.state.write();
@@ -245,7 +284,7 @@ impl DownloadEngine {
                 DownloadItem {
                     id,
                     kind,
-                    url,
+                    url: normalized_url,
                     filename: resolved_filename,
                     save_dir: dir,
                     received_bytes: 0,
@@ -258,6 +297,9 @@ impl DownloadEngine {
                     speed_bps: 0,
                     speed_limit_kbps: 0,
                     added_at: now,
+                    cookies: cookies.filter(|s| !s.trim().is_empty()),
+                    referer: referer.filter(|s| !s.trim().is_empty()),
+                    user_agent: user_agent.filter(|s| !s.trim().is_empty()),
                     info_hash_hex: String::new(),
                     peers_connected: 0,
                     seeders: 0,
@@ -463,144 +505,255 @@ impl DownloadEngine {
         #[cfg(windows)]
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DEFAULT_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
         let _ = std::fs::create_dir_all(&snapshot.save_dir);
-        let part_path = snapshot.part_path();
-        let target_path = snapshot.target_path();
-
-        let existing_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-
-        // Probe total size / range support via HEAD or headers dump
+        let mut current_url = normalize_download_url(&snapshot.url);
+        let cookie_jar = std::env::temp_dir().join(format!("chickenwm_dl_cookies_{id}.txt"));
         let header_path = std::env::temp_dir().join(format!("chickenwm_dl_hdr_{id}.txt"));
-        let _ = std::fs::remove_file(&header_path);
+        let ua = snapshot
+            .user_agent
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(DEFAULT_BROWSER_UA);
 
-        let mut cmd = Command::new("curl.exe");
-        cmd.args([
-            "-sSL",
-            "--fail",
-            "--connect-timeout",
-            "15",
-            "-A",
-            "ChickenWM-Downloader/0.2.1",
-            "-D",
-            &header_path.to_string_lossy(),
-        ]);
-        if existing_len > 0 {
-            cmd.args(["-r", &format!("{existing_len}-")]);
-        }
-        cmd.arg(&snapshot.url);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // Allow up to 3 interstitial hops (e.g. Google Drive /file/d/ -> virus scan form -> direct stream)
+        for attempt in 0..3 {
+            let part_path = self
+                .state
+                .read()
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.part_path())
+                .unwrap_or_else(|| snapshot.part_path());
+            let existing_len = if attempt == 0 {
+                std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            let _ = std::fs::remove_file(&header_path);
 
-        let mut child = cmd.spawn().map_err(|e| anyhow!("failed to spawn curl.exe: {e}"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to open download stream"))?;
-
-        let mut file = if existing_len > 0 {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&part_path)?
-        } else {
-            std::fs::File::create(&part_path)?
-        };
-
-        let mut received = existing_len;
-        let mut headers_parsed = false;
-        let mut buf = [0u8; 16_384];
-        let mut rate_window_start = Instant::now();
-        let mut rate_window_bytes = 0u64;
-        let mut speed_tick = Instant::now();
-        let mut speed_bytes = 0u64;
-
-        loop {
-            if ctrl.stop_flag.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = file.flush();
-                return Ok(());
+            let mut cmd = Command::new("curl.exe");
+            cmd.args([
+                "-sSL",
+                "--fail",
+                "--compressed",
+                "--max-redirs",
+                "30",
+                "--connect-timeout",
+                "20",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "1",
+                "-A",
+                ua,
+                "-b",
+                &cookie_jar.to_string_lossy(),
+                "-c",
+                &cookie_jar.to_string_lossy(),
+                "-D",
+                &header_path.to_string_lossy(),
+            ]);
+            if let Some(ref cookies) = snapshot.cookies {
+                if !cookies.trim().is_empty() {
+                    cmd.args(["-H", &format!("Cookie: {}", cookies.trim())]);
+                }
             }
-
-            let n = stdout.read(&mut buf)?;
-            if n == 0 {
-                break;
+            if let Some(ref referer) = snapshot.referer {
+                if !referer.trim().is_empty() {
+                    cmd.args(["-e", referer.trim()]);
+                }
             }
+            if existing_len > 0 {
+                cmd.args(["-r", &format!("{existing_len}-")]);
+            }
+            cmd.arg(&current_url);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
 
-            if !headers_parsed {
-                if let Some((total, accepted_range)) = parse_dumped_headers(&header_path, existing_len) {
-                    headers_parsed = true;
-                    if existing_len > 0 && !accepted_range {
-                        // Server ignored Range and sent 200 OK from byte 0; truncate and rewrite
-                        file = std::fs::File::create(&part_path)?;
-                        received = 0;
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| anyhow!("failed to spawn curl.exe: {e}"))?;
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("failed to open download stream"))?;
+
+            let mut file = if existing_len > 0 {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&part_path)?
+            } else {
+                std::fs::File::create(&part_path)?
+            };
+
+            let mut received = existing_len;
+            let mut headers_parsed = false;
+            let mut content_type_is_html = false;
+            let mut buf = [0u8; 16_384];
+            let mut rate_window_start = Instant::now();
+            let mut rate_window_bytes = 0u64;
+            let mut speed_tick = Instant::now();
+            let mut speed_bytes = 0u64;
+
+            loop {
+                if ctrl.stop_flag.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                    let _ = file.flush();
+                    let _ = std::fs::remove_file(&header_path);
+                    return Ok(());
+                }
+
+                let n = stdout.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+
+                if !headers_parsed {
+                    if let Some(hdr_info) = parse_dumped_headers(&header_path, existing_len) {
+                        headers_parsed = true;
+                        content_type_is_html = hdr_info.is_html;
+                        if existing_len > 0 && !hdr_info.accepted_range {
+                            // Server ignored Range and sent 200 OK from byte 0; truncate and rewrite
+                            file = std::fs::File::create(&part_path)?;
+                            received = 0;
+                        }
+                        if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id)
+                        {
+                            if hdr_info.total > 0 && !hdr_info.is_html {
+                                item.total_bytes = hdr_info.total;
+                            }
+                            if let Some(ref cd_name) = hdr_info.filename {
+                                let clean_cd = sanitize_filename(cd_name);
+                                if !clean_cd.is_empty() && clean_cd != item.filename {
+                                    item.filename = clean_cd;
+                                }
+                            }
+                        }
                     }
+                }
+
+                file.write_all(&buf[..n])?;
+                received += n as u64;
+                rate_window_bytes += n as u64;
+                speed_bytes += n as u64;
+
+                if speed_tick.elapsed() >= Duration::from_millis(250) {
+                    let dt = speed_tick.elapsed().as_secs_f64().max(0.001);
+                    let bps = (speed_bytes as f64 / dt) as u64;
+                    speed_tick = Instant::now();
+                    speed_bytes = 0;
                     if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id) {
-                        if total > 0 {
-                            item.total_bytes = total;
+                        item.received_bytes = received;
+                        item.speed_bps = bps;
+                    }
+                }
+
+                // Token-bucket rate limiter
+                let limit_kbps = self.effective_limit_kbps(ctrl);
+                if limit_kbps > 0 {
+                    let limit_bps = (limit_kbps as f64) * 1024.0;
+                    let expected_secs = (rate_window_bytes as f64) / limit_bps;
+                    let elapsed = rate_window_start.elapsed().as_secs_f64();
+                    if expected_secs > elapsed {
+                        std::thread::sleep(Duration::from_secs_f64(
+                            (expected_secs - elapsed).min(0.25),
+                        ));
+                    }
+                    if rate_window_start.elapsed() >= Duration::from_secs(1) {
+                        rate_window_start = Instant::now();
+                        rate_window_bytes = 0;
+                    }
+                }
+            }
+
+            file.flush()?;
+            drop(file);
+            let status = child.wait()?;
+
+            // Parse headers one final time in case the file was tiny and finished before the loop parsed them
+            if let Some(hdr_info) = parse_dumped_headers(&header_path, existing_len) {
+                content_type_is_html = hdr_info.is_html;
+                if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id) {
+                    if hdr_info.total > 0 && !hdr_info.is_html {
+                        item.total_bytes = hdr_info.total;
+                    }
+                    if let Some(ref cd_name) = hdr_info.filename {
+                        let clean_cd = sanitize_filename(cd_name);
+                        if !clean_cd.is_empty() && clean_cd != item.filename {
+                            item.filename = clean_cd;
                         }
                     }
                 }
             }
+            let _ = std::fs::remove_file(&header_path);
 
-            file.write_all(&buf[..n])?;
-            received += n as u64;
-            rate_window_bytes += n as u64;
-            speed_bytes += n as u64;
+            if ctrl.stop_flag.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if !status.success() {
+                let _ = std::fs::remove_file(&cookie_jar);
+                bail!("HTTP download interrupted (status {})", status);
+            }
 
-            if speed_tick.elapsed() >= Duration::from_millis(250) {
-                let dt = speed_tick.elapsed().as_secs_f64().max(0.001);
-                let bps = (speed_bytes as f64 / dt) as u64;
-                speed_tick = Instant::now();
-                speed_bytes = 0;
-                if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id) {
-                    item.received_bytes = received;
-                    item.speed_bps = bps;
+            // Check if the response was an HTML confirmation / interstitial page (e.g. Google Drive virus scan or MediaFire)
+            if existing_len == 0
+                && content_type_is_html
+                && received < 512 * 1024
+                && !url_explicitly_requests_html(&current_url)
+            {
+                if let Ok(html_body) = std::fs::read_to_string(&part_path) {
+                    if let Some((next_url, html_filename)) =
+                        resolve_html_interstitial(&current_url, &html_body)
+                    {
+                        if let Some(fname) = html_filename {
+                            let clean = sanitize_filename(&fname);
+                            if !clean.is_empty() {
+                                if let Some(item) =
+                                    self.state.write().items.iter_mut().find(|i| i.id == id)
+                                {
+                                    item.filename = clean;
+                                }
+                            }
+                        }
+                        let _ = std::fs::remove_file(&part_path);
+                        current_url = next_url;
+                        continue;
+                    }
                 }
             }
 
-            // Token-bucket rate limiter
-            let limit_kbps = self.effective_limit_kbps(ctrl);
-            if limit_kbps > 0 {
-                let limit_bps = (limit_kbps as f64) * 1024.0;
-                let expected_secs = (rate_window_bytes as f64) / limit_bps;
-                let elapsed = rate_window_start.elapsed().as_secs_f64();
-                if expected_secs > elapsed {
-                    std::thread::sleep(Duration::from_secs_f64((expected_secs - elapsed).min(0.25)));
-                }
-                if rate_window_start.elapsed() >= Duration::from_secs(1) {
-                    rate_window_start = Instant::now();
-                    rate_window_bytes = 0;
+            let final_target = self
+                .state
+                .read()
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.target_path())
+                .unwrap_or_else(|| snapshot.target_path());
+
+            if final_target.exists() {
+                let _ = std::fs::remove_file(&final_target);
+            }
+            std::fs::rename(&part_path, &final_target)?;
+            if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id) {
+                item.received_bytes = received;
+                if item.total_bytes == 0 {
+                    item.total_bytes = received;
                 }
             }
-        }
-
-        file.flush()?;
-        drop(file);
-        let status = child.wait()?;
-        let _ = std::fs::remove_file(&header_path);
-
-        if ctrl.stop_flag.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&cookie_jar);
             return Ok(());
         }
-        if !status.success() {
-            bail!("HTTP download interrupted (status {})", status);
-        }
 
-        if target_path.exists() {
-            let _ = std::fs::remove_file(&target_path);
-        }
-        std::fs::rename(&part_path, &target_path)?;
-        if let Some(item) = self.state.write().items.iter_mut().find(|i| i.id == id) {
-            item.received_bytes = received;
-            if item.total_bytes == 0 {
-                item.total_bytes = received;
-            }
-        }
-        Ok(())
+        let _ = std::fs::remove_file(&cookie_jar);
+        bail!("Download service required too many confirmation redirects")
     }
 
     fn run_torrent_worker(
@@ -774,12 +927,21 @@ fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn parse_dumped_headers(header_path: &Path, existing_len: u64) -> Option<(u64, bool)> {
+struct DumpedHeaderInfo {
+    total: u64,
+    accepted_range: bool,
+    is_html: bool,
+    filename: Option<String>,
+}
+
+fn parse_dumped_headers(header_path: &Path, existing_len: u64) -> Option<DumpedHeaderInfo> {
     let file = std::fs::File::open(header_path).ok()?;
     let reader = BufReader::new(file);
     let mut status_code = 0u16;
     let mut content_len = 0u64;
     let mut content_range_total = None;
+    let mut content_type = String::new();
+    let mut filename = None;
 
     for line in reader.lines().map_while(Result::ok) {
         let trim = line.trim();
@@ -789,6 +951,7 @@ fn parse_dumped_headers(header_path: &Path, existing_len: u64) -> Option<(u64, b
                     status_code = code;
                     content_len = 0;
                     content_range_total = None;
+                    content_type.clear();
                 }
             }
         } else if let Some((k, v)) = trim.split_once(':') {
@@ -799,6 +962,12 @@ fn parse_dumped_headers(header_path: &Path, existing_len: u64) -> Option<(u64, b
             } else if k_lower == "content-range" {
                 if let Some((_, total_str)) = v_trim.rsplit_once('/') {
                     content_range_total = total_str.trim().parse::<u64>().ok();
+                }
+            } else if k_lower == "content-type" {
+                content_type = v_trim.to_ascii_lowercase();
+            } else if k_lower == "content-disposition" {
+                if let Some(parsed_name) = parse_content_disposition_filename(v_trim) {
+                    filename = Some(parsed_name);
                 }
             }
         }
@@ -815,7 +984,312 @@ fn parse_dumped_headers(header_path: &Path, existing_len: u64) -> Option<(u64, b
             content_len
         }
     });
-    Some((total, accepted_range))
+    let is_html = content_type.starts_with("text/html") || content_type.starts_with("application/xhtml");
+    Some(DumpedHeaderInfo {
+        total,
+        accepted_range,
+        is_html,
+        filename,
+    })
+}
+
+pub fn parse_content_disposition_filename(header_val: &str) -> Option<String> {
+    // Prefer RFC 5987 `filename*=UTF-8''...` first
+    for part in header_val.split(';') {
+        let p = part.trim();
+        let lower = p.to_ascii_lowercase();
+        if let Some(idx) = lower.find("filename*=") {
+            let raw = p[idx + "filename*=".len()..].trim().trim_matches('"');
+            let encoded = if let Some((_, after_quote)) = raw.split_once("''") {
+                after_quote
+            } else {
+                raw
+            };
+            let decoded = crate::torrent::percent_decode(encoded);
+            let clean = sanitize_filename(&decoded);
+            if !clean.is_empty() {
+                return Some(clean);
+            }
+        }
+    }
+    for part in header_val.split(';') {
+        let p = part.trim();
+        let lower = p.to_ascii_lowercase();
+        if let Some(idx) = lower.find("filename=") {
+            let raw = p[idx + "filename=".len()..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            let decoded = crate::torrent::percent_decode(raw);
+            let clean = sanitize_filename(&decoded);
+            if !clean.is_empty() {
+                return Some(clean);
+            }
+        }
+    }
+    None
+}
+
+fn is_generic_placeholder_filename(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        ""
+            | "download"
+            | "download.bin"
+            | "uc"
+            | "view"
+            | "edit"
+            | "open"
+            | "file"
+            | "export"
+    )
+}
+
+fn url_explicitly_requests_html(url: &str) -> bool {
+    let path_part = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    path_part.ends_with(".html") || path_part.ends_with(".htm")
+}
+
+/// Normalizes sharing/viewer links from Google Drive, Google Docs/Sheets/Slides, Dropbox,
+/// GitHub, OneDrive, and Pixeldrain into direct download URLs.
+pub fn normalize_download_url(raw_url: &str) -> String {
+    let trim = raw_url.trim();
+    let lower = trim.to_ascii_lowercase();
+
+    // 1. Google Drive (`/file/d/<ID>`, `/open?id=<ID>`, `/uc?id=<ID>`, `drive.usercontent.google.com`)
+    if lower.contains("drive.google.com") || lower.contains("drive.usercontent.google.com") {
+        if let Some(file_id) = extract_google_drive_id(trim) {
+            // If it is already a `drive.usercontent.google.com/download` URL with `uuid=` or `at=`,
+            // preserve all query params and ensure `confirm=t` is present.
+            if lower.contains("drive.usercontent.google.com/download") {
+                if !lower.contains("confirm=") {
+                    let sep = if trim.contains('?') { '&' } else { '?' };
+                    return format!("{trim}{sep}confirm=t");
+                }
+                return trim.to_string();
+            }
+            return format!(
+                "https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            );
+        }
+    }
+
+    // 2. Google Docs / Sheets / Slides (`/document/d/<ID>/edit`, `/spreadsheets/d/<ID>/edit`, `/presentation/d/<ID>/edit`)
+    if lower.contains("docs.google.com/") && !lower.contains("/export") {
+        for (segment, fmt) in [
+            ("/document/d/", "docx"),
+            ("/spreadsheets/d/", "xlsx"),
+            ("/presentation/d/", "pptx"),
+        ] {
+            if let Some(pos) = lower.find(segment) {
+                let after = &trim[pos + segment.len()..];
+                let doc_id = after
+                    .split(['/', '?', '&', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !doc_id.is_empty() {
+                    let kind_path = &segment[..segment.len() - 1]; // e.g. `/document/d`
+                    return format!("https://docs.google.com{kind_path}/{doc_id}/export?format={fmt}");
+                }
+            }
+        }
+    }
+
+    // 3. Dropbox (`?dl=0` -> `?dl=1`)
+    if lower.contains("dropbox.com/") {
+        if trim.contains("?dl=0") {
+            return trim.replacen("?dl=0", "?dl=1", 1);
+        } else if trim.contains("&dl=0") {
+            return trim.replacen("&dl=0", "&dl=1", 1);
+        } else if !lower.contains("dl=1") && !lower.contains("raw=1") {
+            let sep = if trim.contains('?') { '&' } else { '?' };
+            return format!("{trim}{sep}dl=1");
+        }
+    }
+
+    // 4. GitHub blob links (`https://github.com/<owner>/<repo>/blob/<branch>/<path>`)
+    if let Some(rest) = trim
+        .strip_prefix("https://github.com/")
+        .or_else(|| trim.strip_prefix("http://github.com/"))
+    {
+        let parts: Vec<&str> = rest.splitn(4, '/').collect();
+        if parts.len() == 4 && parts[2] == "blob" {
+            return format!(
+                "https://raw.githubusercontent.com/{}/{}/{}",
+                parts[0], parts[1], parts[3]
+            );
+        }
+    }
+
+    // 5. Pixeldrain (`https://pixeldrain.com/u/<ID>`)
+    if let Some(rest) = trim
+        .strip_prefix("https://pixeldrain.com/u/")
+        .or_else(|| trim.strip_prefix("http://pixeldrain.com/u/"))
+    {
+        let id = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+        if !id.is_empty() {
+            return format!("https://pixeldrain.com/api/file/{id}?download");
+        }
+    }
+
+    // 6. OneDrive embed / view links
+    if lower.contains("onedrive.live.com/embed?") {
+        return trim.replacen("/embed?", "/download?", 1);
+    }
+
+    trim.to_string()
+}
+
+pub fn extract_google_drive_id(url: &str) -> Option<String> {
+    for marker in ["/file/d/", "/folders/"] {
+        if let Some(pos) = url.find(marker) {
+            let after = &url[pos + marker.len()..];
+            let id = after
+                .split(['/', '?', '&', '#'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    if let Some((_, query)) = url.split_once('?') {
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("id") {
+                    let clean = v.split('#').next().unwrap_or(v).trim();
+                    if !clean.is_empty() {
+                        return Some(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parses HTML confirmation / interstitial pages (such as Google Drive's large-file virus-scan
+/// confirmation form or MediaFire's download page) and extracts `(direct_download_url, optional_filename)`.
+pub fn resolve_html_interstitial(current_url: &str, html: &str) -> Option<(String, Option<String>)> {
+    let lower_url = current_url.to_ascii_lowercase();
+
+    // 1. Google Drive confirmation form (`<form id="download-form" action="..."`)
+    if lower_url.contains("drive.google.com")
+        || lower_url.contains("drive.usercontent.google.com")
+        || lower_url.contains("googleusercontent.com")
+        || html.contains("download-form")
+        || html.contains("uc-download-link")
+    {
+        let discovered_filename = extract_gdrive_html_filename(html);
+
+        // Look for `<form ... action="..."`
+        if let Some(form_pos) = html.find("id=\"download-form\"").or_else(|| html.find("action=\"https://drive.usercontent.google.com/download\"")) {
+            let form_region_start = html[..form_pos].rfind("<form").unwrap_or(form_pos);
+            let form_region_end = html[form_region_start..]
+                .find("</form>")
+                .map(|e| form_region_start + e)
+                .unwrap_or(html.len());
+            let form_slice = &html[form_region_start..form_region_end];
+
+            let action = extract_attr_value(form_slice, "action")
+                .unwrap_or_else(|| "https://drive.usercontent.google.com/download".to_string())
+                .replace("&amp;", "&");
+
+            let mut params: Vec<(String, String)> = Vec::new();
+            let mut search_from = 0;
+            while let Some(inp_rel) = form_slice[search_from..].find("<input") {
+                let inp_start = search_from + inp_rel;
+                let Some(inp_end_rel) = form_slice[inp_start..].find('>') else {
+                    break;
+                };
+                let tag = &form_slice[inp_start..inp_start + inp_end_rel + 1];
+                if let Some(name) = extract_attr_value(tag, "name") {
+                    let val = extract_attr_value(tag, "value").unwrap_or_default();
+                    params.push((name, val));
+                }
+                search_from = inp_start + inp_end_rel + 1;
+            }
+
+            if !params.is_empty() {
+                let qs: Vec<String> = params
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                let sep = if action.contains('?') { '&' } else { '?' };
+                let resolved = format!("{action}{sep}{}", qs.join("&"));
+                return Some((resolved, discovered_filename));
+            }
+        }
+
+        // Fallback: look for `href=".../uc?export=download..."`
+        if let Some(href_pos) = html.find("/uc?export=download") {
+            let start = html[..href_pos].rfind('"').map(|i| i + 1).unwrap_or(href_pos);
+            let end = html[href_pos..]
+                .find('"')
+                .map(|i| href_pos + i)
+                .unwrap_or(html.len());
+            let raw_href = html[start..end].replace("&amp;", "&");
+            let full = if raw_href.starts_with("http") {
+                raw_href
+            } else {
+                format!("https://drive.google.com{raw_href}")
+            };
+            if full != current_url {
+                return Some((full, discovered_filename));
+            }
+        }
+    }
+
+    // 2. MediaFire direct download button (`href="https://download...mediafire.com/..."`)
+    if lower_url.contains("mediafire.com") {
+        if let Some(pos) = html.find("https://download") {
+            let end = html[pos..]
+                .find(['"', '\''])
+                .map(|i| pos + i)
+                .unwrap_or(html.len());
+            let direct = &html[pos..end];
+            if direct.contains("mediafire.com/") {
+                return Some((direct.to_string(), None));
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pat = format!("{attr}={quote}");
+        if let Some(pos) = tag.find(&pat) {
+            let start = pos + pat.len();
+            if let Some(end_rel) = tag[start..].find(quote) {
+                return Some(tag[start..start + end_rel].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_gdrive_html_filename(html: &str) -> Option<String> {
+    if let Some(pos) = html.find("class=\"uc-name-size\"") {
+        let after = &html[pos..];
+        if let Some(a_start) = after.find("<a") {
+            let after_a = &after[a_start..];
+            if let Some(gt) = after_a.find('>') {
+                let content = &after_a[gt + 1..];
+                if let Some(lt) = content.find("</a>") {
+                    let name = content[..lt].trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn detect_is_torrent(url: &str, filename: Option<&str>) -> bool {
@@ -858,6 +1332,9 @@ pub fn infer_filename_from_url(url: &str, is_torrent: bool) -> String {
         }
         return "magnet-download.torrent".to_string();
     }
+    if let Some(gd_id) = extract_google_drive_id(trim) {
+        return format!("gdrive-{}.bin", &gd_id[..gd_id.len().min(10)]);
+    }
     let without_query = trim.split('?').next().unwrap_or(trim);
     let last_seg = without_query
         .rsplit('/')
@@ -866,7 +1343,7 @@ pub fn infer_filename_from_url(url: &str, is_torrent: bool) -> String {
         .trim();
     let decoded = crate::torrent::percent_decode(last_seg);
     let clean = sanitize_filename(&decoded);
-    if !clean.is_empty() && clean != "." {
+    if !clean.is_empty() && clean != "." && !is_generic_placeholder_filename(&clean) {
         clean
     } else if is_torrent {
         "download.torrent".to_string()
@@ -992,5 +1469,62 @@ mod tests {
         assert_eq!(torrent_item.filename, "Linux.iso");
 
         let _ = std::fs::remove_file(&tmp_json);
+    }
+
+    #[test]
+    fn normalizes_google_drive_and_cloud_service_urls() {
+        assert_eq!(
+            normalize_download_url("https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view?usp=sharing"),
+            "https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download&confirm=t"
+        );
+        assert_eq!(
+            normalize_download_url("https://drive.google.com/open?id=1AbCdEfGhIjKlMnOpQrStUvWxYz"),
+            "https://drive.usercontent.google.com/download?id=1AbCdEfGhIjKlMnOpQrStUvWxYz&export=download&confirm=t"
+        );
+        assert_eq!(
+            normalize_download_url("https://www.dropbox.com/s/xyz123/archive.zip?dl=0"),
+            "https://www.dropbox.com/s/xyz123/archive.zip?dl=1"
+        );
+        assert_eq!(
+            normalize_download_url("https://github.com/org/repo/blob/main/release/tool.zip"),
+            "https://raw.githubusercontent.com/org/repo/main/release/tool.zip"
+        );
+        assert_eq!(
+            normalize_download_url("https://pixeldrain.com/u/abc123xyz"),
+            "https://pixeldrain.com/api/file/abc123xyz?download"
+        );
+    }
+
+    #[test]
+    fn parses_google_drive_confirmation_html_and_content_disposition() {
+        let html = r#"
+            <html><body>
+            <span class="uc-name-size"><a href="/open?id=1AbCdEf">ChickenWM-Bundle.zip</a> (142M)</span>
+            <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+                <input type="hidden" name="id" value="1AbCdEf">
+                <input type="hidden" name="export" value="download">
+                <input type="hidden" name="confirm" value="t">
+                <input type="hidden" name="uuid" value="9988-7766">
+            </form>
+            </body></html>
+        "#;
+        let (url, fname) = resolve_html_interstitial(
+            "https://drive.usercontent.google.com/download?id=1AbCdEf&export=download",
+            html,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://drive.usercontent.google.com/download?id=1AbCdEf&export=download&confirm=t&uuid=9988-7766"
+        );
+        assert_eq!(fname.as_deref(), Some("ChickenWM-Bundle.zip"));
+
+        assert_eq!(
+            parse_content_disposition_filename(
+                "attachment; filename=\"fallback.zip\"; filename*=UTF-8''ChickenWM%20Release%20v2.zip"
+            )
+            .as_deref(),
+            Some("ChickenWM Release v2.zip")
+        );
     }
 }
