@@ -59,6 +59,8 @@ pub struct DownloadItem {
     pub total_bytes: u64,
     pub status: DownloadStatus,
     pub speed_bps: u64,
+    #[serde(default)]
+    pub upload_speed_bps: u64,
     /// Optional per-download speed limit in KB/s (`0` = follow global limit).
     #[serde(default)]
     pub speed_limit_kbps: u32,
@@ -125,6 +127,8 @@ pub struct PersistedState {
     pub default_save_dir: String,
     pub ask_save_location: bool,
     pub global_speed_limit_kbps: u32,
+    #[serde(default)]
+    pub global_upload_limit_kbps: u32,
     pub next_id: u64,
     pub items: Vec<DownloadItem>,
 }
@@ -138,8 +142,9 @@ impl Default for PersistedState {
             .into_owned();
         Self {
             default_save_dir: default_dir,
-            ask_save_location: true,
+            ask_save_location: false,
             global_speed_limit_kbps: 0,
+            global_upload_limit_kbps: 0,
             next_id: 1,
             items: Vec::new(),
         }
@@ -177,6 +182,7 @@ pub struct DownloadEngine {
     pub state: Arc<RwLock<PersistedState>>,
     pub state_path: PathBuf,
     pub global_limit_kbps: Arc<AtomicU32>,
+    pub global_upload_limit_kbps: Arc<AtomicU32>,
     workers: Arc<RwLock<HashMap<u64, Arc<WorkerControl>>>>,
 }
 
@@ -187,6 +193,19 @@ impl DownloadEngine {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        // Purge any legacy mockup/placeholder items if ever persisted
+        let before_len = persisted.items.len();
+        persisted.items.retain(|item| {
+            !matches!(
+                item.url.as_str(),
+                "https://updates.cdn-apple.com/2024/macos/052-40112/macOS_Sonoma_14.5_Restore.ipsw"
+                    | "https://cdimage.debian.org/debian-cd/current/amd64/iso-dvd/debian-12.5.0-amd64-DVD-1.iso"
+                    | "https://developer.apple.com/services-account/download?path=/Developer_Tools/Xcode_15.4/Xcode_15.4_Developer_Preview.xip"
+                    | "magnet:?xt=urn:btih:arch-x86_64"
+            )
+        });
+        let purged_placeholders = persisted.items.len() != before_len;
+
         // Any download that was `Downloading` when the app closed is marked `Paused` so the user
         // can resume it cleanly with one click (preserving its `.part` file on disk).
         for item in &mut persisted.items {
@@ -194,6 +213,7 @@ impl DownloadEngine {
                 item.status = DownloadStatus::Paused;
             }
             item.speed_bps = 0;
+            item.upload_speed_bps = 0;
             if item.kind == DownloadKind::Http && item.status != DownloadStatus::Completed {
                 if let Ok(meta) = std::fs::metadata(item.part_path()) {
                     item.received_bytes = meta.len();
@@ -202,12 +222,18 @@ impl DownloadEngine {
         }
 
         let global_limit = Arc::new(AtomicU32::new(persisted.global_speed_limit_kbps));
-        Arc::new(Self {
+        let global_upload_limit = Arc::new(AtomicU32::new(persisted.global_upload_limit_kbps));
+        let eng = Arc::new(Self {
             state: Arc::new(RwLock::new(persisted)),
             state_path,
             global_limit_kbps: global_limit,
+            global_upload_limit_kbps: global_upload_limit,
             workers: Arc::new(RwLock::new(HashMap::new())),
-        })
+        });
+        if purged_placeholders {
+            eng.save();
+        }
+        eng
     }
 
     pub fn save(&self) {
@@ -226,6 +252,12 @@ impl DownloadEngine {
     pub fn set_global_speed_limit(self: &Arc<Self>, kbps: u32) {
         self.global_limit_kbps.store(kbps, Ordering::Relaxed);
         self.state.write().global_speed_limit_kbps = kbps;
+        self.save();
+    }
+
+    pub fn set_global_upload_limit(self: &Arc<Self>, kbps: u32) {
+        self.global_upload_limit_kbps.store(kbps, Ordering::Relaxed);
+        self.state.write().global_upload_limit_kbps = kbps;
         self.save();
     }
 
@@ -317,6 +349,7 @@ impl DownloadEngine {
                         DownloadStatus::Paused
                     },
                     speed_bps: 0,
+                    upload_speed_bps: 0,
                     speed_limit_kbps: 0,
                     added_at: now,
                     cookies: cookies.filter(|s| !s.trim().is_empty()),
