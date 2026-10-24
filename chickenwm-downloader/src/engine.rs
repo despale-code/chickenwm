@@ -1443,7 +1443,7 @@ pub fn format_bytes(bytes: u64) -> String {
     const GB: f64 = MB * 1024.0;
     let b = bytes as f64;
     if b >= GB {
-        format!("{:.2} GB", b / GB)
+        format!("{:.1} GB", b / GB)
     } else if b >= MB {
         format!("{:.1} MB", b / MB)
     } else if b >= KB {
