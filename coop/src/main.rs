@@ -692,8 +692,13 @@ async fn main() -> Result<()> {
                                     }
                                     let is_focused = *key == (fg_hwnd.0 as isize);
                                     let is_tiled = entry.role == WindowRole::Tiled;
-                                    // Forced border radius is ONLY for tiled windows!
-                                    let quad_radius = if is_tiled { corner_radius } else { 0 };
+                                    let quad_radius = if is_tiled {
+                                        corner_radius
+                                    } else if entry.role == WindowRole::TransparentOverlay {
+                                        16
+                                    } else {
+                                        0
+                                    };
                                     let force_opaque =
                                         matches!(entry.role, WindowRole::Tiled | WindowRole::Desktop);
 
