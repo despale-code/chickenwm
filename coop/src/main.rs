@@ -857,34 +857,32 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if in_expose_transition || !entry.capture.has_frame {
-                if let Some(ref cdev) = capture_dev {
-                    let _ = entry.capture.poll_next_frame(cdev);
-                    if entry.capture.handle_recreated {
-                        entry.capture.handle_recreated = false;
-                        if let Some(ref ctx) = vk_ctx {
-                            if let Some(ds) = entry.descriptor_set.take() {
-                                unsafe {
-                                    pipeline.free_texture_descriptor_set(&ctx.device, ds);
-                                }
+            if let Some(ref cdev) = capture_dev {
+                let _ = entry.capture.poll_next_frame(cdev);
+                if entry.capture.handle_recreated {
+                    entry.capture.handle_recreated = false;
+                    if let Some(ref ctx) = vk_ctx {
+                        if let Some(ds) = entry.descriptor_set.take() {
+                            unsafe {
+                                pipeline.free_texture_descriptor_set(&ctx.device, ds);
                             }
-                            if let Some(mut old_tex) = entry.vk_tex.take() {
-                                unsafe {
-                                    ctx.wait_idle();
-                                    old_tex.destroy(&ctx.device);
-                                }
-                            }
-                            entry.vk_tex = ctx
-                                .import_dxgi_texture(
-                                    entry.capture.shared_handle,
-                                    entry.capture.capacity_w,
-                                    entry.capture.capacity_h,
-                                )
-                                .ok();
-                            entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
-                                pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
-                            });
                         }
+                        if let Some(mut old_tex) = entry.vk_tex.take() {
+                            unsafe {
+                                ctx.wait_idle();
+                                old_tex.destroy(&ctx.device);
+                            }
+                        }
+                        entry.vk_tex = ctx
+                            .import_dxgi_texture(
+                                entry.capture.shared_handle,
+                                entry.capture.capacity_w,
+                                entry.capture.capacity_h,
+                            )
+                            .ok();
+                        entry.descriptor_set = entry.vk_tex.as_ref().and_then(|t| {
+                            pipeline.allocate_texture_descriptor_set(&ctx.device, t.view)
+                        });
                     }
                 }
             }
@@ -933,7 +931,6 @@ async fn main() -> Result<()> {
             let active_popups = HierarchyTracker::active_popups();
 
             for (idx, sc) in swapchains.iter_mut().enumerate() {
-                sc.set_opaque_backdrop(locked || show_expose_backdrop);
                 let (mon_x, mon_y) = monitor_origins.get(idx).copied().unwrap_or((0, 0));
                 let mon_w = sc.width;
                 let mon_h = sc.height;
@@ -942,7 +939,7 @@ async fn main() -> Result<()> {
                     ctx,
                     clear_rgba,
                     |cmd_buf, _dst_img| {
-                        if !locked && show_expose_backdrop {
+                        if !locked {
                             // Transition all captured window textures to SHADER_READ_ONLY_OPTIMAL for alpha-blended sampling
                             for key in &z_ordered_keys {
                                 if let Some(entry) = managed_windows.get(key) {
@@ -991,7 +988,7 @@ async fn main() -> Result<()> {
                                     let Some(entry) = managed_windows.get(key) else {
                                         continue;
                                     };
-                                    if show_expose_backdrop && !entry.capture.has_frame {
+                                    if !entry.capture.has_frame {
                                         continue;
                                     }
                                     let in_pass = match pass {
@@ -1021,34 +1018,32 @@ async fn main() -> Result<()> {
                                     let force_opaque =
                                         matches!(entry.role, WindowRole::Tiled | WindowRole::Desktop);
 
-                                    if show_expose_backdrop {
-                                        if let Some(ds) = entry.descriptor_set {
-                                            let uv_scale = if let Some(ref tex) = entry.vk_tex {
-                                                [
-                                                    (entry.capture.width as f32
-                                                        / tex.width.max(1) as f32)
-                                                        .clamp(0.0, 1.0),
-                                                    (entry.capture.height as f32
-                                                        / tex.height.max(1) as f32)
-                                                        .clamp(0.0, 1.0),
-                                                ]
-                                            } else {
-                                                [1.0, 1.0]
-                                            };
-                                            pipeline.record_textured_quad(
-                                                device,
-                                                cmd_buf,
-                                                ds,
-                                                &entry.quad,
-                                                mon_x,
-                                                mon_y,
-                                                mon_w,
-                                                mon_h,
-                                                quad_radius,
-                                                force_opaque,
-                                                uv_scale,
-                                            );
-                                        }
+                                    if let Some(ds) = entry.descriptor_set {
+                                        let uv_scale = if let Some(ref tex) = entry.vk_tex {
+                                            [
+                                                (entry.capture.width as f32
+                                                    / tex.width.max(1) as f32)
+                                                    .clamp(0.0, 1.0),
+                                                (entry.capture.height as f32
+                                                    / tex.height.max(1) as f32)
+                                                    .clamp(0.0, 1.0),
+                                            ]
+                                        } else {
+                                            [1.0, 1.0]
+                                        };
+                                        pipeline.record_textured_quad(
+                                            device,
+                                            cmd_buf,
+                                            ds,
+                                            &entry.quad,
+                                            mon_x,
+                                            mon_y,
+                                            mon_w,
+                                            mon_h,
+                                            quad_radius,
+                                            force_opaque,
+                                            uv_scale,
+                                        );
                                     }
 
                                     match entry.role {

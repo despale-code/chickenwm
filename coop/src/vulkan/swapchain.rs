@@ -137,9 +137,7 @@ pub fn create_monitor_canvas_window(info: &PhysicalMonitorInfo) -> Result<HWND> 
             None,
         )?;
 
-        // Use LWA_COLORKEY (RGB 0,0,0 -> transparent) in normal desktop mode so the opaque
-        // Win32 Vulkan swapchain never blacks out the desktop when cleared to [0, 0, 0, 0].
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_COLORKEY);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 254, LWA_ALPHA);
         let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,
