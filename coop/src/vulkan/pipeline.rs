@@ -68,7 +68,7 @@ pub fn premultiplied_alpha_blend_attachment() -> vk::PipelineColorBlendAttachmen
         .color_write_mask(vk::ColorComponentFlags::RGBA)
 }
 
-/// Push constants for the textured window quad pipeline (premultiplied alpha + SDF corner clip).
+/// Push constants for the textured window quad pipeline (premultiplied alpha + SDF corner clip + Vulkan icy blur & dimming).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct WindowQuadPushConstants {
@@ -76,8 +76,13 @@ pub struct WindowQuadPushConstants {
     pub rect: [f32; 4],
     /// `(screen_width, screen_height, corner_radius, force_opaque_rgb)`.
     pub screen_and_radius: [f32; 4],
-    /// `(u_scale, v_scale, 0.0, 0.0)` mapping `[0, 1]` quad UV to active sub-region of the padded capture texture.
+    /// `(u_scale, v_scale, ov_u_scale, ov_v_scale)`.
     pub uv_scale: [f32; 4],
+    /// `(u_offset, v_offset, brightness, mode)`:
+    /// - `mode = 0.0`: standard window quad
+    /// - `mode = 1.0`: Vulkan icy frosted blur backdrop pass (`win_tex` = bg, `mask_tex` = overlay)
+    /// - `mode = 2.0`: translucent icy overlay quad pass (`roobar` / popover / notification)
+    pub uv_offset_and_mode: [f32; 4],
 }
 
 const QUAD_SHADER_WGSL: &str = r#"
@@ -85,6 +90,7 @@ struct WindowQuadPushConstants {
     rect: vec4<f32>,
     screen_and_radius: vec4<f32>,
     uv_scale: vec4<f32>,
+    uv_offset_and_mode: vec4<f32>,
 };
 
 var<push_constant> pc: WindowQuadPushConstants;
@@ -94,10 +100,16 @@ var win_tex: texture_2d<f32>;
 @group(0) @binding(1)
 var win_sampler: sampler;
 
+@group(1) @binding(0)
+var mask_tex: texture_2d<f32>;
+@group(1) @binding(1)
+var mask_sampler: sampler;
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) local_p: vec2<f32>,
+    @location(2) ov_uv: vec2<f32>,
 };
 
 @vertex
@@ -119,8 +131,9 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
 
     var out: VertexOutput;
     out.position = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
-    out.uv = uv * pc.uv_scale.xy;
+    out.uv = pc.uv_offset_and_mode.xy + uv * pc.uv_scale.xy;
     out.local_p = pixel_pos - center;
+    out.ov_uv = uv * pc.uv_scale.zw;
     return out;
 }
 
@@ -129,9 +142,39 @@ fn sd_rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
     return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
+fn sample_icy_blur(base_uv: vec2<f32>, step_uv: vec2<f32>) -> vec3<f32> {
+    var acc = textureSampleLevel(win_tex, win_sampler, clamp(base_uv, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.14;
+
+    // Inner ring (radius 1.0x)
+    let r1 = step_uv * 4.5;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r1.x,  0.0), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.085;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r1.x,  0.0), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.085;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( 0.0,  r1.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.085;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( 0.0, -r1.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.085;
+
+    // Middle ring diagonals (radius 2.2x)
+    let r2 = step_uv * 10.0;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r2.x,  r2.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.065;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r2.x,  r2.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.065;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r2.x, -r2.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.065;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r2.x, -r2.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.065;
+
+    // Outer wide frost ring (radius 4.0x)
+    let r3 = step_uv * 18.0;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r3.x,  0.0), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r3.x,  0.0), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( 0.0,  r3.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( 0.0, -r3.y), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r3.x * 0.7,  r3.y * 0.7), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r3.x * 0.7,  r3.y * 0.7), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>( r3.x * 0.7, -r3.y * 0.7), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+    acc += textureSampleLevel(win_tex, win_sampler, clamp(base_uv + vec2<f32>(-r3.x * 0.7, -r3.y * 0.7), vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * 0.0325;
+
+    return acc;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(win_tex, win_sampler, in.uv);
     let half_size = pc.rect.zw * 0.5;
     let max_r = min(half_size.x, half_size.y);
     let r = clamp(pc.screen_and_radius.z, 0.0, max_r);
@@ -146,16 +189,54 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
+    let brightness = clamp(pc.uv_offset_and_mode.z, 0.15, 1.0);
+    let mode = pc.uv_offset_and_mode.w;
+
+    // Mode 1.0: Vulkan Icy Frosted Blur backdrop masked by the overlay surface alpha
+    if (mode > 0.5 && mode < 1.5) {
+        let ov_sample = textureSample(mask_tex, mask_sampler, in.ov_uv);
+        let mask_cov = smoothstep(0.02, 0.30, ov_sample.a) * clip_cov;
+        if (mask_cov <= 0.001) {
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+
+        let tex_dims = vec2<f32>(textureDimensions(win_tex));
+        let step_uv = vec2<f32>(1.0, 1.0) / max(tex_dims, vec2<f32>(64.0, 64.0));
+        let blurred = sample_icy_blur(in.uv, step_uv);
+
+        // Cool icy frost refraction + subtle top frost sheen
+        let luma = dot(blurred, vec3<f32>(0.299, 0.587, 0.114));
+        let desat = mix(blurred, vec3<f32>(luma), 0.25);
+        let v_grad = clamp((in.local_p.y + half_size.y) / max(pc.rect.w, 1.0), 0.0, 1.0);
+        let ice_tint = mix(vec3<f32>(0.76, 0.88, 1.0), vec3<f32>(0.56, 0.72, 0.92), v_grad);
+        let icy_rgb = (mix(desat * 0.78, ice_tint, 0.18) + vec3<f32>(0.03, 0.05, 0.08) * (1.0 - v_grad)) * brightness;
+        let out_a = 0.96 * mask_cov;
+        return vec4<f32>(icy_rgb * out_a, out_a);
+    }
+
+    let tex_color = textureSample(win_tex, win_sampler, in.uv);
+
     // pc.screen_and_radius.w > 0.5 indicates an opaque client surface (e.g. tiled app / wallpaper)
     // where GDI child controls might leave alpha=0; <= 0.5 preserves per-pixel alpha (roobar, popovers, etc.)
     if (pc.screen_and_radius.w > 0.5) {
-        return vec4<f32>(tex_color.rgb * clip_cov, clip_cov);
+        return vec4<f32>(tex_color.rgb * brightness * clip_cov, clip_cov);
     }
 
     if (tex_color.a <= 0.001) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    return tex_color * clip_cov;
+
+    // Mode 2.0: Translucent icy overlay surface (roobar, Control Center, Notification Center)
+    // Lets the Vulkan icy blur backdrop shine through card backgrounds while keeping text/icons 100% crisp
+    if (mode > 1.5) {
+        let luma = dot(tex_color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+        let is_bg = clamp(1.0 - smoothstep(0.32, 0.72, luma), 0.0, 1.0);
+        let glass_scale = mix(1.0, 0.76, is_bg);
+        let scaled = tex_color * glass_scale * clip_cov;
+        return vec4<f32>(scaled.rgb * brightness, scaled.a);
+    }
+
+    return vec4<f32>(tex_color.rgb * brightness * clip_cov, tex_color.a * clip_cov);
 }
 "#;
 
@@ -417,7 +498,7 @@ impl CompositorPipeline {
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
                 .size(std::mem::size_of::<WindowQuadPushConstants>() as u32)];
-            let set_layouts = [self.quad_desc_layout];
+            let set_layouts = [self.quad_desc_layout, self.quad_desc_layout];
             let quad_layout_info = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&set_layouts)
                 .push_constant_ranges(&quad_pc_ranges);
@@ -608,6 +689,40 @@ impl CompositorPipeline {
         force_opaque: bool,
         uv_scale: [f32; 2],
     ) {
+        self.record_textured_quad_ex(
+            device,
+            cmd_buf,
+            ds,
+            quad,
+            mon_x,
+            mon_y,
+            mon_w,
+            mon_h,
+            radius,
+            force_opaque,
+            uv_scale,
+            1.0,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_textured_quad_ex(
+        &self,
+        device: &ash::Device,
+        cmd_buf: vk::CommandBuffer,
+        ds: vk::DescriptorSet,
+        quad: &WindowQuad,
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        radius: i32,
+        force_opaque: bool,
+        uv_scale: [f32; 2],
+        brightness: f32,
+        icy_overlay: bool,
+    ) {
         if self.quad_pipeline == vk::Pipeline::null()
             || self.quad_layout == vk::PipelineLayout::null()
             || ds == vk::DescriptorSet::null()
@@ -631,7 +746,13 @@ impl CompositorPipeline {
                 r as f32,
                 if force_opaque { 1.0 } else { 0.0 },
             ],
-            uv_scale: [uv_scale[0], uv_scale[1], 0.0, 0.0],
+            uv_scale: [uv_scale[0], uv_scale[1], uv_scale[0], uv_scale[1]],
+            uv_offset_and_mode: [
+                0.0,
+                0.0,
+                brightness.clamp(0.15, 1.0),
+                if icy_overlay { 2.0 } else { 0.0 },
+            ],
         };
 
         unsafe {
@@ -645,7 +766,7 @@ impl CompositorPipeline {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.quad_layout,
                 0,
-                &[ds],
+                &[ds, ds],
                 &[],
             );
             let pc_bytes = std::slice::from_raw_parts(
@@ -660,6 +781,116 @@ impl CompositorPipeline {
                 pc_bytes,
             );
             device.cmd_draw(cmd_buf, 6, 1, 0, 0);
+        }
+    }
+
+    /// Records a Vulkan Icy Frosted Glass Blur pass of `bg_quad` (`bg_ds`) masked to the exact
+    /// rounded bounds and per-pixel alpha footprint of `ov_quad` (`ov_ds`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_icy_blur_backdrop(
+        &self,
+        device: &ash::Device,
+        cmd_buf: vk::CommandBuffer,
+        bg_ds: vk::DescriptorSet,
+        bg_quad: &WindowQuad,
+        bg_uv_scale: [f32; 2],
+        ov_ds: vk::DescriptorSet,
+        ov_quad: &WindowQuad,
+        ov_uv_scale: [f32; 2],
+        mon_x: i32,
+        mon_y: i32,
+        mon_w: u32,
+        mon_h: u32,
+        ov_radius: i32,
+        brightness: f32,
+    ) {
+        if self.quad_pipeline == vk::Pipeline::null()
+            || self.quad_layout == vk::PipelineLayout::null()
+            || bg_ds == vk::DescriptorSet::null()
+            || ov_ds == vk::DescriptorSet::null()
+        {
+            return;
+        }
+
+        let ov_x = (ov_quad.physics.position.x.round() as i32) - mon_x;
+        let ov_y = (ov_quad.physics.position.y.round() as i32) - mon_y;
+        let ov_w = ov_quad.width.round() as i32;
+        let ov_h = ov_quad.height.round() as i32;
+
+        let bg_x = (bg_quad.physics.position.x.round() as i32) - mon_x;
+        let bg_y = (bg_quad.physics.position.y.round() as i32) - mon_y;
+        let bg_w = bg_quad.width.round() as i32;
+        let bg_h = bg_quad.height.round() as i32;
+
+        if ov_w <= 0 || ov_h <= 0 || bg_w <= 0 || bg_h <= 0 {
+            return;
+        }
+
+        // Compute intersection of bg_quad, ov_quad, and monitor bounds for hardware scissor
+        let ix0 = ov_x.max(bg_x).clamp(0, mon_w as i32);
+        let iy0 = ov_y.max(bg_y).clamp(0, mon_h as i32);
+        let ix1 = (ov_x + ov_w).min(bg_x + bg_w).clamp(0, mon_w as i32);
+        let iy1 = (ov_y + ov_h).min(bg_y + bg_h).clamp(0, mon_h as i32);
+        if ix1 <= ix0 || iy1 <= iy0 {
+            return;
+        }
+
+        let u_offset = ((ov_x - bg_x) as f32 / bg_w as f32) * bg_uv_scale[0];
+        let v_offset = ((ov_y - bg_y) as f32 / bg_h as f32) * bg_uv_scale[1];
+        let u_span = (ov_w as f32 / bg_w as f32) * bg_uv_scale[0];
+        let v_span = (ov_h as f32 / bg_h as f32) * bg_uv_scale[1];
+        let r = ov_radius.clamp(0, (ov_w / 2).min(ov_h / 2));
+
+        let pc = WindowQuadPushConstants {
+            rect: [ov_x as f32, ov_y as f32, ov_w as f32, ov_h as f32],
+            screen_and_radius: [mon_w.max(1) as f32, mon_h.max(1) as f32, r as f32, 0.0],
+            uv_scale: [u_span, v_span, ov_uv_scale[0], ov_uv_scale[1]],
+            uv_offset_and_mode: [u_offset, v_offset, brightness.clamp(0.15, 1.0), 1.0],
+        };
+
+        let isect_scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: ix0, y: iy0 },
+            extent: vk::Extent2D {
+                width: (ix1 - ix0) as u32,
+                height: (iy1 - iy0) as u32,
+            },
+        }];
+        let full_scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: mon_w,
+                height: mon_h,
+            },
+        }];
+
+        unsafe {
+            device.cmd_set_scissor(cmd_buf, 0, &isect_scissor);
+            device.cmd_bind_pipeline(
+                cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.quad_pipeline,
+            );
+            device.cmd_bind_descriptor_sets(
+                cmd_buf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.quad_layout,
+                0,
+                &[bg_ds, ov_ds],
+                &[],
+            );
+            let pc_bytes = std::slice::from_raw_parts(
+                &pc as *const WindowQuadPushConstants as *const u8,
+                std::mem::size_of::<WindowQuadPushConstants>(),
+            );
+            device.cmd_push_constants(
+                cmd_buf,
+                self.quad_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes,
+            );
+            device.cmd_draw(cmd_buf, 6, 1, 0, 0);
+            device.cmd_set_scissor(cmd_buf, 0, &full_scissor);
         }
     }
 
@@ -1106,5 +1337,15 @@ mod tests {
         assert_eq!(vs[0], 0x07230203);
         assert_eq!(fs[0], 0x07230203);
         assert_eq!(std::mem::size_of::<BorderPushConstants>(), 80);
+    }
+
+    #[test]
+    fn test_compile_quad_spirv_valid() {
+        let (vs, fs) = compile_quad_spirv().expect("WGSL quad shader must compile to SPIR-V");
+        assert!(!vs.is_empty());
+        assert!(!fs.is_empty());
+        assert_eq!(vs[0], 0x07230203);
+        assert_eq!(fs[0], 0x07230203);
+        assert_eq!(std::mem::size_of::<WindowQuadPushConstants>(), 64);
     }
 }

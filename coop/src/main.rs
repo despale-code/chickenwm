@@ -200,7 +200,6 @@ fn classify_window_role(hwnd: HWND) -> WindowRole {
             || title == "ChickenWM Power"
             || title == "ChickenWM Launcher"
             || title == "ChickenWM Notifications"
-            || title == "ChickenWM Downloader"
             || class == "#32768"
         {
             return WindowRole::TransparentOverlay;
@@ -920,10 +919,13 @@ async fn main() -> Result<()> {
         if let Some(ref ctx) = vk_ctx {
             let locked = SESSION_LOCKED.load(Ordering::Acquire);
             let show_expose_backdrop = expose.active || expose.transition_progress > 0.01;
+            let display_brightness = chickenwm_core::sys::get_vulkan_display_brightness_norm();
             let clear_rgba = if locked {
                 [0.04, 0.04, 0.07, 1.0]
             } else if show_expose_backdrop {
                 [0.05, 0.05, 0.08, 0.94] // Opaque dimmed backdrop so native Win32 windows underneath don't bleed through Exposé gaps
+            } else if display_brightness < 0.995 {
+                [0.0, 0.0, 0.0, (1.0 - display_brightness).clamp(0.0, 0.85)]
             } else {
                 [0.0, 0.0, 0.0, 0.0] // Transparent clear (colorkeyed out via LWA_COLORKEY) so desktop & windows never turn black
             };
@@ -1031,7 +1033,63 @@ async fn main() -> Result<()> {
                                         } else {
                                             [1.0, 1.0]
                                         };
-                                        pipeline.record_textured_quad(
+
+                                        let is_icy_overlay = matches!(
+                                            entry.role,
+                                            WindowRole::Roobar | WindowRole::TransparentOverlay
+                                        );
+
+                                        // Render Vulkan Icy Frosted Glass Blur behind Roobar & Overlay items
+                                        if is_icy_overlay {
+                                            for bg_key in &z_ordered_keys {
+                                                let Some(bg_entry) = managed_windows.get(bg_key) else {
+                                                    continue;
+                                                };
+                                                if !bg_entry.capture.has_frame
+                                                    || !matches!(
+                                                        bg_entry.role,
+                                                        WindowRole::Desktop
+                                                            | WindowRole::Tiled
+                                                            | WindowRole::Floating
+                                                    )
+                                                {
+                                                    continue;
+                                                }
+                                                let Some(bg_ds) = bg_entry.descriptor_set else {
+                                                    continue;
+                                                };
+                                                let bg_uv_scale = if let Some(ref tex) = bg_entry.vk_tex {
+                                                    [
+                                                        (bg_entry.capture.width as f32
+                                                            / tex.width.max(1) as f32)
+                                                            .clamp(0.0, 1.0),
+                                                        (bg_entry.capture.height as f32
+                                                            / tex.height.max(1) as f32)
+                                                            .clamp(0.0, 1.0),
+                                                    ]
+                                                } else {
+                                                    [1.0, 1.0]
+                                                };
+                                                pipeline.record_icy_blur_backdrop(
+                                                    device,
+                                                    cmd_buf,
+                                                    bg_ds,
+                                                    &bg_entry.quad,
+                                                    bg_uv_scale,
+                                                    ds,
+                                                    &entry.quad,
+                                                    uv_scale,
+                                                    mon_x,
+                                                    mon_y,
+                                                    mon_w,
+                                                    mon_h,
+                                                    quad_radius,
+                                                    display_brightness,
+                                                );
+                                            }
+                                        }
+
+                                        pipeline.record_textured_quad_ex(
                                             device,
                                             cmd_buf,
                                             ds,
@@ -1043,6 +1101,8 @@ async fn main() -> Result<()> {
                                             quad_radius,
                                             force_opaque,
                                             uv_scale,
+                                            display_brightness,
+                                            is_icy_overlay,
                                         );
                                     }
 
