@@ -317,7 +317,8 @@ async fn main() -> Result<()> {
                 let h = (rc.bottom - rc.top).max(1) as f32;
 
                 if let Some(entry) = managed_windows.get_mut(&key) {
-                    entry.quad.update_targets(Vec2::new(x, y), Vec2::new(w, h));
+                    entry.quad.physics.target = Vec2::new(x, y);
+                    entry.quad.size_physics.target = Vec2::new(w, h);
                     entry.quad.z_order = z_idx as i32;
                 } else if !failed_hwnds.contains(&key) {
                     heal_native_window_frame(hwnd);
@@ -407,10 +408,11 @@ async fn main() -> Result<()> {
                     (rc.right - rc.left).max(1) as f32,
                     (rc.bottom - rc.top).max(1) as f32,
                 );
-                fg_entry.quad.update_targets(target_pos, target_size);
+                fg_entry.quad.physics.target = target_pos;
+                fg_entry.quad.size_physics.target = target_size;
 
                 if lbutton_down {
-                    // Real-time drag: snap corner bounds directly to target with zero lag
+                    // Real-time drag: snap directly to target with zero lag/oscillation
                     fg_entry.quad.physics.position = target_pos;
                     fg_entry.quad.physics.velocity = Vec2::default();
                     fg_entry.quad.size_physics.position = target_size;
@@ -446,15 +448,13 @@ async fn main() -> Result<()> {
             }
 
             if lbutton_down && entry.quad.hwnd == fg_hwnd {
-                // Keep corner bounds locked to target position during real-time mouse drag,
-                // while stepping `bulge_physics` so middle squash/stretch animates smoothly!
+                // Keep locked to target position during real-time mouse drag
                 entry.quad.physics.position = entry.quad.physics.target;
                 entry.quad.physics.velocity = Vec2::default();
                 entry.quad.size_physics.position = entry.quad.size_physics.target;
                 entry.quad.size_physics.velocity = Vec2::default();
                 entry.quad.width = entry.quad.size_physics.target.x;
                 entry.quad.height = entry.quad.size_physics.target.y;
-                entry.quad.bulge_physics.step(dt);
             } else {
                 entry.quad.step(dt);
             }
@@ -494,19 +494,9 @@ async fn main() -> Result<()> {
                                             let y1 = y0 + (entry.quad.height.round() as i32);
 
                                             unsafe {
-                                                ctx.record_blit_window_deformed(
-                                                    cmd_buf,
-                                                    tex.image,
-                                                    tex.width,
-                                                    tex.height,
-                                                    dst_img,
-                                                    x0,
-                                                    y0,
-                                                    x1,
-                                                    y1,
-                                                    mon_w,
-                                                    mon_h,
-                                                    entry.quad.bulge(),
+                                                ctx.record_blit_window(
+                                                    cmd_buf, tex.image, tex.width, tex.height,
+                                                    dst_img, x0, y0, x1, y1, mon_w, mon_h,
                                                 );
                                             }
                                         }
