@@ -82,6 +82,8 @@ pub struct BorderPushConstants {
     pub inner_top_color: [f32; 4],
     /// Background color `[r, g, b, a]` used to mask sharp 90-degree blitted corners outside the rounded arc.
     pub corner_mask_color: [f32; 4],
+    /// Elastic squash-and-stretch middle bulge/smoosh `(bulge_x, bulge_y, 0.0, 0.0)` in pixels.
+    pub bulge: [f32; 4],
 }
 
 const BORDER_SHADER_WGSL: &str = r#"
@@ -91,6 +93,7 @@ struct BorderPushConstants {
     outer_color: vec4<f32>,
     inner_top_color: vec4<f32>,
     corner_mask_color: vec4<f32>,
+    bulge: vec4<f32>,
 };
 
 var<push_constant> pc: BorderPushConstants;
@@ -112,9 +115,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
         default: { uv = vec2<f32>(1.0, 1.0); }
     }
 
-    let margin = 2.0;
-    let box_min = pc.rect.xy - vec2<f32>(margin, margin);
-    let box_size = pc.rect.zw + vec2<f32>(margin * 2.0, margin * 2.0);
+    let extra_bulge = max(pc.bulge.xy, vec2<f32>(0.0, 0.0));
+    let margin = vec2<f32>(3.0, 3.0) + extra_bulge;
+    let box_min = pc.rect.xy - margin;
+    let box_size = pc.rect.zw + margin * 2.0;
     let pixel_pos = box_min + uv * box_size;
 
     let center = pc.rect.xy + pc.rect.zw * 0.5;
@@ -135,22 +139,44 @@ fn sd_rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let half_size = pc.rect.zw * 0.5;
-    let max_r = min(half_size.x, half_size.y);
-    let r = clamp(pc.screen_and_radius.z, 0.0, max_r);
     let p = in.local_p;
 
-    let d = sd_rounded_box(p, half_size, r);
+    let u = clamp(p.x / max(pc.rect.z, 1.0) + 0.5, 0.0, 1.0);
+    let v = clamp(p.y / max(pc.rect.w, 1.0) + 0.5, 0.0, 1.0);
 
-    if (d < -1.5 || d > 1.5) {
+    let profile_x = 4.0 * v * (1.0 - v);
+    let profile_y = 4.0 * u * (1.0 - u);
+
+    let deformed_half = max(
+        half_size + vec2<f32>(pc.bulge.x * profile_x, pc.bulge.y * profile_y),
+        vec2<f32>(8.0, 8.0)
+    );
+    let max_r = min(deformed_half.x, deformed_half.y);
+    let r = clamp(pc.screen_and_radius.z, 0.0, max_r);
+
+    let d = sd_rounded_box(p, deformed_half, r);
+
+    let in_corner_box = r > 0.5
+        && abs(p.x) <= deformed_half.x + 1.5
+        && abs(p.y) <= deformed_half.y + 1.5
+        && abs(p.x) > deformed_half.x - r
+        && abs(p.y) > deformed_half.y - r;
+
+    if (d < -1.5 || (d > 2.5 && !in_corner_box)) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // 1. Anti-aliased corner clipping mask inside the 4 corner regions of the blitted rectangular window
+    // 1. Anti-aliased corner & deformed-edge clipping mask
     var mask_cov = 0.0;
-    if (r > 0.5 && abs(p.x) <= half_size.x && abs(p.y) <= half_size.y) {
-        if (abs(p.x) > half_size.x - r && abs(p.y) > half_size.y - r) {
-            mask_cov = clamp(d + 0.5, 0.0, 1.0);
-        }
+    if (in_corner_box) {
+        mask_cov = clamp(d + 0.5, 0.0, 1.0);
+    }
+    if ((abs(pc.bulge.x) > 0.25 || abs(pc.bulge.y) > 0.25)
+        && abs(p.x) <= deformed_half.x + 1.5
+        && abs(p.y) <= deformed_half.y + 1.5)
+    {
+        let edge_mask = clamp(d + 0.5, 0.0, 1.0) * clamp(2.5 - d, 0.0, 1.0);
+        mask_cov = max(mask_cov, edge_mask);
     }
     let a_m = pc.corner_mask_color.a * mask_cov;
     let rgb_m = pc.corner_mask_color.rgb;
@@ -159,8 +185,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let outer_cov = clamp(min(d + 0.5, 1.5 - d), 0.0, 1.0);
 
     // 3. Anti-aliased 1px inner top specular bevel: inset 0 1px 0 0
-    // Inside original rounded box (d <= 0) and outside rounded box shifted down by +1px (d_shift >= 0)
-    let d_shift = sd_rounded_box(p - vec2<f32>(0.0, 1.0), half_size, r);
+    // Inside original deformed rounded box (d <= 0) and outside deformed rounded box shifted down by +1px (d_shift >= 0)
+    let p_shift = p - vec2<f32>(0.0, 1.0);
+    let v_shift = clamp(p_shift.y / max(pc.rect.w, 1.0) + 0.5, 0.0, 1.0);
+    let deformed_half_shift = max(
+        half_size + vec2<f32>(pc.bulge.x * 4.0 * v_shift * (1.0 - v_shift), pc.bulge.y * profile_y),
+        vec2<f32>(8.0, 8.0)
+    );
+    let d_shift = sd_rounded_box(p_shift, deformed_half_shift, r);
     let inner_cov = clamp(min(0.5 - d, 0.5 + d_shift), 0.0, 1.0);
 
     let a_outer = pc.outer_color.a * outer_cov;
@@ -532,12 +564,14 @@ impl CompositorPipeline {
         if self.border_pipeline != vk::Pipeline::null()
             && self.border_layout != vk::PipelineLayout::null()
         {
+            let [bx, by] = quad.bulge();
             let pc = BorderPushConstants {
                 rect: [local_x as f32, local_y as f32, w as f32, h as f32],
                 screen_and_radius: [mon_w.max(1) as f32, mon_h.max(1) as f32, r as f32, 0.0],
                 outer_color: colors.outer,
                 inner_top_color: colors.inner_top,
                 corner_mask_color: colors.corner_mask,
+                bulge: [bx, by, 0.0, 0.0],
             };
 
             unsafe {
@@ -707,6 +741,6 @@ mod tests {
         // SPIR-V magic number: 0x07230203
         assert_eq!(vs[0], 0x07230203);
         assert_eq!(fs[0], 0x07230203);
-        assert_eq!(std::mem::size_of::<BorderPushConstants>(), 80);
+        assert_eq!(std::mem::size_of::<BorderPushConstants>(), 96);
     }
 }
