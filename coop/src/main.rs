@@ -194,28 +194,19 @@ fn heal_native_window_frame(hwnd: HWND, role: WindowRole) {
         let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
 
         if matches!(role, WindowRole::Roobar | WindowRole::TransparentOverlay) {
-            // Never strip WS_CAPTION from non-WS_POPUP windows (doing so while WS_SYSMENU is set
-            // causes user32 DefWindowProcW to paint a fallback classic Win95 caption on click/WM_NCACTIVATE).
-            // If WS_CAPTION was previously stripped on a non-popup window, restore it so winit/subclass
-            // WM_NCCALCSIZE + DWM handles it cleanly.
-            if (cur & WS_POPUP.0) == 0 && (cur & WS_CAPTION.0) == 0 {
-                let _ = SetWindowLongW(hwnd, GWL_STYLE, (cur | WS_CAPTION.0) as i32);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
-            }
             let no_round = DWMWCP_DONOTROUND;
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &no_round as *const _ as *const core::ffi::c_void,
                 std::mem::size_of_val(&no_round) as u32,
+            );
+            let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &no_border as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
             );
             let no_backdrop: u32 = 1; // DWMSBT_NONE
             let _ = DwmSetWindowAttribute(
@@ -735,7 +726,9 @@ async fn main() -> Result<()> {
                                     }
 
                                     match entry.role {
-                                        WindowRole::Desktop | WindowRole::TransparentOverlay => {}
+                                        WindowRole::Desktop
+                                        | WindowRole::TransparentOverlay
+                                        | WindowRole::Floating => {}
                                         WindowRole::Roobar => {
                                             // Roobar, when not floating (docked full monitor width),
                                             // only renders border on bottom and has 0 border radius.
@@ -756,25 +749,6 @@ async fn main() -> Result<()> {
                                                     true,
                                                 );
                                             }
-                                        }
-                                        WindowRole::Floating => {
-                                            // Floating windows do not get forced border radius
-                                            let colors = if is_focused {
-                                                focused_colors
-                                            } else {
-                                                unfocused_colors
-                                            };
-                                            pipeline.record_mac_dual_rim_border(
-                                                device,
-                                                cmd_buf,
-                                                &entry.quad,
-                                                mon_x,
-                                                mon_y,
-                                                mon_w,
-                                                mon_h,
-                                                colors,
-                                                0,
-                                            );
                                         }
                                         WindowRole::Tiled => {
                                             let colors = if is_focused {
